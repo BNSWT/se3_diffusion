@@ -225,6 +225,7 @@ def plot_sample_grid(samples, num_res, motif_bb_3d=None, true_bb_3d=None):
 def plot_se3(se3_vec, ax_lim=None, title=None, ax=None):
     if ax is None:
         fig = plt.figure(figsize=(8, 8))
+        fig.set_layout_engine()
         ax = fig.add_subplot(111, projection="3d")
     visualization.plot(se3_vec, ax=ax, space="SE3_GROUP")
     bb_trans = se3_vec[:, 3:]
@@ -301,15 +302,19 @@ def write_traj(
         _ = plot_trans(du.move_to_np(sample_traj[0]))
 
     def update(frame):
+        # pass time step
+        if isinstance(frame,tuple):
+            t = frame[0]
+            frame = frame[1]
         ax.clear()
         if se3_vecs:
-            plot_se3(extract_se3_vec(frame), ax=ax, ax_lim=ax_lim)
+            plot_se3(extract_se3_vec(frame), ax=ax, ax_lim=ax_lim,title='t : %.3f'%(1- float(t)/sample_traj.shape[0]) )
         else:
             plot_trans(du.move_to_np(sample_traj[frame]))
     anim = FuncAnimation(
         fig,
         update,
-        frames=list(range(1, sample_traj.shape[0])),
+        frames=[ (i,frame) for i,frame in enumerate(list(range(1, sample_traj.shape[0])))],
         interval=10,
         blit=False)
     writergif = animation.PillowWriter(fps=30) 

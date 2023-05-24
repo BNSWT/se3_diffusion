@@ -99,16 +99,17 @@ def main(args):
     
     pdb_dict_list = []
     c = 0
-    
-    if folder_with_pdbs_path[-1]!='/':
-        folder_with_pdbs_path = folder_with_pdbs_path+'/'
-    
+    if os.path.isfile(folder_with_pdbs_path):
+        biounit_names = [folder_with_pdbs_path]
+    else:
+        if folder_with_pdbs_path[-1]!='/':
+            folder_with_pdbs_path = folder_with_pdbs_path+'/'
+        biounit_names = glob.glob(folder_with_pdbs_path+'*.pdb')
     
     init_alphabet = ['A', 'B', 'C', 'D', 'E', 'F', 'G','H', 'I', 'J','K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T','U', 'V','W','X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g','h', 'i', 'j','k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't','u', 'v','w','x', 'y', 'z']
     extra_alphabet = [str(item) for item in list(np.arange(300))]
     chain_alphabet = init_alphabet + extra_alphabet
     
-    biounit_names = glob.glob(folder_with_pdbs_path+'*.pdb')
     for biounit in biounit_names:
         my_dict = {}
         s = 0

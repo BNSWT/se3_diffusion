@@ -4,7 +4,15 @@ defaults:
 
 inference:
   name: null
-  gpu_id: null  # CUDA GPU to use
+
+  timestap : False # This should be turned on if multi-job is submmited with same inference name
+
+  gpu_id: 0  # CUDA GPU to use
+
+  single_process : False # Use single processor, not recommended if use pyrosetta-mpnn protocol, but useful for debug
+
+  cpu_num : 8 # Num of cpu use in mpnn-rosetta optimization
+
   seed: 123
 
   # Directory of software, weights, and outputs.
@@ -25,13 +33,54 @@ inference:
 
   samples:
     # Number of backbone samples per sequence length.
-    samples_per_length: 10
+    samples_per_length: 200
     # Number of ESMFdold samples per backbone sample.
     seq_per_sample: 8
     # Minimum sequence length to sample.
     min_length: 100
     # Maximum sequence length to sample.
-    max_length: 500
+    max_length: 300
     # gap between lengths to sample. i.e. this script will sample all lengths
     # in range(min_length, max_length, length_step)
-    length_step: 5
+    length_step: 50
+  option:
+    self_consistency : True
+    save_trajactory : False
+    plot : 
+      switch_on : False
+      flip : False
+  mpnn : 
+    pmpnn_dir : ${inference.pmpnn_dir}
+
+    gpu_id : ${inference.gpu_id}
+    # Use CA_only model of backbone_atom model
+    ca_only : False
+    # Model name, 48_020 means 48 neighbour and 0.2 A noise
+    model_name : v_48_020
+
+    # Num CPU for rosetta relax, one processor for one scaffold
+    cpus : ${inference.cpu_num}
+
+    # Whether optimize backbone by rosetta fades
+    fades : False
+
+    # Relax cycle for each sequence sample, min cycle is 1 for sidechain pack, 0 will only give sequence
+    cycle : 1
+
+    # Selection of best quence on current scaffold based on mpnn score rather than direct sample one sequence
+    best_selection:
+      switch_on : False
+      sample_nums : 32
+
+    # Number of sequence feed to ESMFdold per backbone.
+    num_seqs : ${inference.samples.seq_per_sample}
+
+    # Sequence sampling temprature, higher temprature give more diverse sequence but lower quality
+    temperature : 0.1
+
+    # Backbone noise
+    backbone_noise : 0.00
+
+    # dump mpnn structure with packed sidechain
+    dump : True 
+

@@ -719,6 +719,7 @@ class Experiment:
         reverse_steps = np.linspace(min_t, 1.0, num_t)[::-1]
         dt = 1/num_t
         all_rigids = [du.move_to_np(copy.deepcopy(sample_feats['rigids_t']))]
+        all_rigids_0 = []
         all_bb_prots = []
         all_trans_0_pred = []
         all_bb_0_pred = []
@@ -754,7 +755,7 @@ class Experiment:
                 sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)
                 if aux_traj:
                     all_rigids.append(du.move_to_np(rigids_t.to_tensor_7()))
-
+                    all_rigids_0.append(du.move_to_np(rigid_pred))
                 # Calculate x0 prediction derived from score predictions.
                 gt_trans_0 = sample_feats['rigids_t'][..., 4:]
                 pred_trans_0 = rigid_pred[..., 4:]
@@ -777,6 +778,7 @@ class Experiment:
         all_bb_prots = flip(all_bb_prots)
         if aux_traj:
             all_rigids = flip(all_rigids)
+            all_rigids_0 = flip(all_rigids_0)
             all_trans_0_pred = flip(all_trans_0_pred)
             all_bb_0_pred = flip(all_bb_0_pred)
 
@@ -787,7 +789,8 @@ class Experiment:
             ret['rigid_traj'] = all_rigids
             ret['trans_traj'] = all_trans_0_pred
             ret['psi_pred'] = psi_pred[None]
-            ret['rigid_0_traj'] = all_bb_0_pred
+            ret['rigid_0_traj'] = all_rigids_0
+            ret['prot_0_traj'] = all_bb_0_pred
         return ret
 
 

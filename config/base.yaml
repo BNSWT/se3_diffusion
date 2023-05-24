@@ -41,6 +41,8 @@ diffuser:
     cache_dir: .cache/
 
 model:
+  # control if sidechain prediction is trained
+  sidechain : False
   node_embed_size: 256
   edge_embed_size: 128
   dropout: 0.0
@@ -52,6 +54,7 @@ model:
     min_bin: 1e-5
     max_bin: 20.0
   ipa:
+    sidechain : ${model.sidechain}
     c_s: ${model.node_embed_size}
     c_z: ${model.edge_embed_size}
     c_hidden: 256
