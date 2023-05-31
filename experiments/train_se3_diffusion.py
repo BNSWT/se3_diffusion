@@ -178,28 +178,31 @@ class Experiment:
         return self._conf
 
     def create_dataset(self):
-
+        conf_train = DictConfig(self._data_conf)
+        conf_train.update(self._data_conf.train)
+        conf_eval = DictConfig(self._data_conf)
+        conf_eval.update(self._data_conf.eval)
         # Datasets
         train_dataset = pdb_data_loader.PdbDataset(
-            data_conf=self._data_conf,
+            data_conf=conf_train,
             diffuser=self._diffuser,
             is_training=True
         )
 
         valid_dataset = pdb_data_loader.PdbDataset(
-            data_conf=self._data_conf,
+            data_conf=conf_eval,
             diffuser=self._diffuser,
             is_training=False
         )
         if not self._use_ddp:
             train_sampler = pdb_data_loader.TrainSampler(
-                data_conf=self._data_conf,
+                data_conf=conf_train,
                 dataset=train_dataset,
                 batch_size=self._exp_conf.batch_size,
             )
         else:
             train_sampler = pdb_data_loader.DistributedTrainSampler(
-                data_conf=self._data_conf,
+                data_conf=conf_train,
                 dataset=train_dataset,
                 batch_size=self._exp_conf.batch_size,
             )
@@ -207,8 +210,10 @@ class Experiment:
 
         # Loaders
         num_workers = self._exp_conf.num_loader_workers
+        print(conf_train)
         train_loader = du.create_data_loader(
             train_dataset,
+            data_conf=conf_train,
             sampler=train_sampler,
             np_collate=False,
             length_batch=True,
@@ -220,6 +225,7 @@ class Experiment:
         )
         valid_loader = du.create_data_loader(
             valid_dataset,
+            data_conf=conf_eval,
             sampler=valid_sampler,
             np_collate=False,
             length_batch=False,

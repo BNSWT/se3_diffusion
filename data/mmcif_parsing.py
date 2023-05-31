@@ -25,6 +25,7 @@ from Bio.Data import SCOPData
 
 # Type aliases:
 ChainId = str
+AssemblyId = str
 PdbHeader = Mapping[str, Any]
 PdbStructure = PDB.Structure.Structure
 SeqRes = str
@@ -378,6 +379,37 @@ def _get_protein_chains(
       for chain_id in chain_ids:
         valid_chains[chain_id] = seq_info
   return valid_chains
+
+def get_assembly_mapping(
+  parsed_info: Mapping[str, Any]) -> Mapping[AssemblyId,Mapping[str,Any]]:
+  """Extracts assembly info
+
+  Args:
+    parsed_info: parsed_info
+
+  Returns:
+    A dict of assembly property to each assembly id 
+  """
+  # Get assembly property
+  assembly_property = {}
+  _pdbx_struct_assembly = mmcif_loop_to_dict('_pdbx_struct_assembly.', '_pdbx_struct_assembly.id', parsed_info)
+  _pdbx_struct_assembly_gen = mmcif_loop_to_dict('_pdbx_struct_assembly_gen.', '_pdbx_struct_assembly_gen.assembly_id', parsed_info)
+  for assembly_id in _pdbx_struct_assembly:
+    assembly_property[assembly_id] = {
+      # Who defined the assembly way : author_defined_assembly, software_defined_assembly ..etc
+      "details": _pdbx_struct_assembly[assembly_id]['_pdbx_struct_assembly.details'],
+      # the definition of assembly way : monomeric, dimeric ...etc
+      "oligomeric_details":_pdbx_struct_assembly[assembly_id]["_pdbx_struct_assembly.oligomeric_details"],
+      # How many chains in this assembly
+      "oligomeric_count": _pdbx_struct_assembly[assembly_id]['_pdbx_struct_assembly.oligomeric_count'],
+      # the operation in this assembly 
+      # more details can be view in https://mmcif.wwpdb.org/dictionaries/mmcif_pdbx_v40.dic/Categories/pdbx_struct_oper_list.html
+      "oper_expression" : _pdbx_struct_assembly_gen[assembly_id]["_pdbx_struct_assembly_gen.oper_expression"],
+      # chains list in this assembly
+      "asym_id_list" : _pdbx_struct_assembly_gen[assembly_id]["_pdbx_struct_assembly_gen.asym_id_list"].strip().split(',')
+      }
+    
+  return assembly_property
 
 
 def _is_set(data: str) -> bool:

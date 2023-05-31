@@ -20,6 +20,17 @@ data:
   samples_per_eval_length: 4
   num_eval_lengths: 10
   num_t: 100
+  train:
+    crop: True
+    crop_size: 512
+  eval:
+    crop: False
+    crop_size: null
+  # config used in strcture prediction/ , not available here
+  max_template_hits: 0
+  max_templates: 0
+  subsample_templates: False
+  shuffle_top_k_prefiltered : 0
 
 diffuser:
   diffuse_trans: True

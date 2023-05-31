@@ -5,13 +5,15 @@
 - Performs any additional processing.
 - Writes all processed examples out to specified path.
 """
-
+import tree
+import logging
 import argparse
 import dataclasses
 import functools as fn
 import multiprocessing as mp
 import os
 import time
+import io
 
 import mdtraj as md
 import numpy as np
@@ -21,14 +23,30 @@ from tqdm import tqdm
 
 from data import errors, mmcif_parsing, parsers
 from data import utils as du
+from data import residue_constants
+from data.protein import Protein,to_pdb
+from data.utils import quaternary_category
 
+from Bio.Seq import Seq
+from Bio import pairwise2
+
+
+logging.basicConfig(level=logging.INFO,
+    # define this things every time set basic config
+    format="[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
+    datefmt="%d/%b/%Y %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+    ])
+base_dir = os.path.dirname(os.path.abspath(__file__))+'/'
 # Define the parser
 parser = argparse.ArgumentParser(
     description='mmCIF processing script.')
 parser.add_argument(
     '--mmcif_dir',
     help='Path to directory with mmcif files.',
-    type=str)
+    type=str,
+    default=base_dir+'./mmCIF/')
 parser.add_argument(
     '--max_file_size',
     help='Max file size.',
@@ -45,20 +63,15 @@ parser.add_argument(
     type=float,
     default=5.0)
 parser.add_argument(
-    '--max_len',
-    help='Max length of protein.',
-    type=int,
-    default=512)
-parser.add_argument(
     '--num_processes',
     help='Number of processes.',
     type=int,
-    default=100)
+    default=20)
 parser.add_argument(
     '--write_dir',
     help='Path to write results to.',
     type=str,
-    default='./data/processed_pdb')
+    default=base_dir+'./processed_pdb')
 parser.add_argument(
     '--debug',
     help='Turn on for debugging.',
@@ -67,6 +80,68 @@ parser.add_argument(
     '--verbose',
     help='Whether to log everything.',
     action='store_true')
+
+def score_sequence(seq_i,seq_j):
+    alignments = pairwise2.align.globalxx(seq_i, seq_j)
+    
+    # Get the alignment score
+    alignment_score = alignments[0].score
+    
+    # Calculate the similarity as a percentage
+    similarity = (alignment_score / len(seq_i)) * 100
+    return similarity
+
+def assembly_filter(struct_chains,assembels):
+    """ this function aims to extract all chains needed for all unique assembly in this cif
+        assembels (Mapping[assemble_id,str]):
+            details: Who defined the assembly way : author_defined_assembly, software_defined_assembly ..etc
+            oligomeric_details: the definition of assembly way : monomeric, dimeric ...etc
+            oligomeric_count: How many chains in this assemble
+            oper_expression : chains list in this assemble
+            asym_id_list : List[str] chain ids of this assemble
+        
+        Return:
+            chain_sets : all chains id needed for all unique assembles
+            assembely_sets : all unique assembles id
+        
+    """
+    chain_sets = set()
+    chain_sequence = {}
+    assembely_sets = {}
+    for chain_id, chain in struct_chains.items():
+        chain_sequence[chain_id] = "".join([ residue_constants.restype_3to1.get(res.resname, 'X') for res in chain ]).strip("X")
+    
+    for assemble_id,assembely_property in assembels.items():
+
+        ######### currently only not support oper_expression !!! #############
+        if assembely_property['oper_expression'] != '1':
+            continue
+
+        assemble_sequences = [chain_sequence[chain_id] for chain_id in assembely_property['asym_id_list'] if chain_id in struct_chains and chain_sequence[chain_id] != ""]
+        
+        if assembely_property['oligomeric_details'] not in assembely_sets:
+            assembely_sets[assembely_property['oligomeric_details']] = {assemble_id:assemble_sequences}
+        else:
+            # check if this is a new assmbles compare to previous asemmble in same oligomeric type
+            # by all-to-all sequence alignment
+            one_to_all_match = {assemble_id:True for assemble_id in list(assembely_sets[assembely_property['oligomeric_details']].keys())}
+            for pre_assemble_id,pre_assemble_sequences in assembely_sets[assembely_property['oligomeric_details']].items():
+                for assemble_sequence in assemble_sequences:
+                    if not any([min(score_sequence(assemble_sequence,pre_assemble_sequence),score_sequence(pre_assemble_sequence,assemble_sequence))>95 for pre_assemble_sequence in pre_assemble_sequences]):
+                        one_to_all_match[pre_assemble_id] = False
+                        break
+                if one_to_all_match[pre_assemble_id] == True:
+                    # this assemble has matched of pre assemble, drop it
+                    break
+            if not any([match for ammseble_id,match in one_to_all_match.items()]):
+                # no match, add this assemble to unique assemble
+                assembely_sets[assembely_property['oligomeric_details']][assemble_id] = assemble_sequences
+    for assembely_set in assembely_sets:
+        for assemble_id in assembely_sets[assembely_set]:
+            for chain_id in assembels[assemble_id]['asym_id_list']:
+                chain_sets.add(chain_id)
+    assembely_sets = set([assemble_id  for oligomeric_details,assembles in assembely_sets.items() for assemble_id in assembles])
+    return chain_sets,assembely_sets
 
 
 def _retrieve_mmcif_files(
@@ -86,8 +161,8 @@ def _retrieve_mmcif_files(
             total_num_files += 1
             if min_file_size <= os.path.getsize(mmcif_path) <= max_file_size:
                 all_mmcif_paths.append(mmcif_path)
-        if debug and total_num_files >= 100:
-            # Don't process all files for debugging
+        if debug and total_num_files >= 10:
+            all_mmcif_paths = all_mmcif_paths[:10]
             break
     print(
         f'Processing {len(all_mmcif_paths)} files our of {total_num_files}')
@@ -95,13 +170,12 @@ def _retrieve_mmcif_files(
 
 
 def process_mmcif(
-        mmcif_path: str, max_resolution: int, max_len: int, write_dir: str):
+        mmcif_path: str, max_resolution: int, write_dir: str , verbose : bool):
     """Processes MMCIF files into usable, smaller pickles.
 
     Args:
         mmcif_path: Path to mmcif file to read.
         max_resolution: Max resolution to allow.
-        max_len: Max length to allow.
         write_dir: Directory to write pickles to.
 
     Returns:
@@ -111,15 +185,15 @@ def process_mmcif(
         DataError if a known filtering rule is hit.
         All other errors are unexpected and are propogated.
     """
-    metadata = {}
+    # metadata as assemble as a unit
+    metadatas = []
+    assemble_metadatas = []
     mmcif_name = os.path.basename(mmcif_path).replace('.cif', '')
-    metadata['pdb_name'] = mmcif_name
     mmcif_subdir = os.path.join(write_dir, mmcif_name[1:3].lower())
     if not os.path.isdir(mmcif_subdir):
         os.mkdir(mmcif_subdir)
     processed_mmcif_path = os.path.join(mmcif_subdir, f'{mmcif_name}.pkl')
     processed_mmcif_path = os.path.abspath(processed_mmcif_path)
-    metadata['processed_path'] = processed_mmcif_path
     try:
         with open(mmcif_path, 'r') as f:
             parsed_mmcif = mmcif_parsing.parse(
@@ -128,129 +202,157 @@ def process_mmcif(
         raise errors.FileExistsError(
             f'Error file do not exist {mmcif_path}'
         )
-    metadata['raw_path'] = mmcif_path
     if parsed_mmcif.errors:
         raise errors.MmcifParsingError(
             f'Encountered errors {parsed_mmcif.errors}'
         )
     parsed_mmcif = parsed_mmcif.mmcif_object
     raw_mmcif = parsed_mmcif.raw_string
-    if '_pdbx_struct_assembly.oligomeric_count' in raw_mmcif:
-        raw_olig_count = raw_mmcif['_pdbx_struct_assembly.oligomeric_count']
-        oligomeric_count = ','.join(raw_olig_count).lower()
-    else:
-        oligomeric_count = None
-    if '_pdbx_struct_assembly.oligomeric_details' in raw_mmcif:
-        raw_olig_detail = raw_mmcif['_pdbx_struct_assembly.oligomeric_details']
-        oligomeric_detail = ','.join(raw_olig_detail).lower()
-    else:
-        oligomeric_detail = None
-    metadata['oligomeric_count'] = oligomeric_count
-    metadata['oligomeric_detail'] = oligomeric_detail
 
     # Parse mmcif header
     mmcif_header = parsed_mmcif.header
     mmcif_resolution = mmcif_header['resolution']
-    metadata['resolution'] = mmcif_resolution
-    metadata['structure_method'] = mmcif_header['structure_method']
     if mmcif_resolution >= max_resolution:
         raise errors.ResolutionError(
             f'Too high resolution {mmcif_resolution}')
     if mmcif_resolution == 0.0:
         raise errors.ResolutionError(
             f'Invalid resolution {mmcif_resolution}')
+    # TODO flatern medadatas
+    metadata = {
+        'pdb_name' : mmcif_name,
+        'processed_path' : processed_mmcif_path,
+        'raw_path' : mmcif_path,
+        'resolution': mmcif_resolution,
+        'structure_method' : mmcif_header['structure_method'],
+        'release_date' : mmcif_header["release_date"]
+    }
 
     # Extract all chains
+    # fix bug, chain id of upper letter and lower case can exist in the same file
     struct_chains = {
-        chain.id.upper(): chain
+        chain.id: chain
         for chain in parsed_mmcif.structure.get_chains()}
-    metadata['num_chains'] = len(struct_chains)
 
+    # We only dump this chains, by the description of cif file)
+        # 
+    keep_chains = None
+
+    ##### assemble filter for all unique assembles and their chains #####
+    if '_pdbx_struct_assembly.oligomeric_count' in raw_mmcif:
+        assembly_property = mmcif_parsing.get_assembly_mapping(raw_mmcif)
+        keep_chains,keep_assembles = assembly_filter(struct_chains,assembly_property)
+        # only keep protein chains
+        keep_chains = [chain_id for chain_id in keep_chains if chain_id in struct_chains]
+        for assemble_id in keep_assembles:
+            protein_chains = [chain_id for chain_id in  assembly_property[assemble_id]['asym_id_list'] if chain_id in keep_chains]
+            assemble_metadatas.append({
+                'assemble_id' : assemble_id,
+                'details' : assembly_property[assemble_id]['details'],
+                'oligomeric_details': assembly_property[assemble_id]['oligomeric_details'],
+                'oligomeric_count': assembly_property[assemble_id]['oligomeric_count'],
+                'oper_expression': assembly_property[assemble_id]['oper_expression'],
+                'asym_id_list': protein_chains,
+            })
+        # Return when there is no proper assemble by reasons below:
+        # 1. those assembles need oper_expression not support now
+        if not keep_assembles:
+            return None
+    # except Exception as e:
+    #     raise errors.MmcifParsingError(f"Error occured during parsing assembles of {mmcif_path} \n{e}")
     # Extract features
-    struct_feats = []
-    all_seqs = set()
+    chains_dict = {}
+
     for chain_id, chain in struct_chains.items():
-        # Convert chain id into int
-        chain_id = du.chain_str_to_int(chain_id)
+
+        # direct use char chain id
         chain_prot = parsers.process_chain(chain, chain_id)
         chain_dict = dataclasses.asdict(chain_prot)
-        chain_dict = du.parse_chain_feats(chain_dict)
-        all_seqs.add(tuple(chain_dict['aatype']))
-        struct_feats.append(chain_dict)
-    if len(all_seqs) == 1:
-        metadata['quaternary_category'] = 'homomer'
-    else:
-        metadata['quaternary_category'] = 'heteromer'
-    complex_feats = du.concat_np_features(struct_feats, False)
 
-    # Process geometry features
-    complex_aatype = complex_feats['aatype']
-    modeled_idx = np.where(complex_aatype != 20)[0]
-    if np.sum(complex_aatype != 20) == 0:
-        raise errors.LengthError('No modeled residues')
-    min_modeled_idx = np.min(modeled_idx)
-    max_modeled_idx = np.max(modeled_idx)
-    metadata['seq_len'] = len(complex_aatype)
-    metadata['modeled_seq_len'] = max_modeled_idx - min_modeled_idx + 1
-    complex_feats['modeled_idx'] = modeled_idx
-    if complex_aatype.shape[0] > max_len:
-        raise errors.LengthError(
-            f'Too long {complex_aatype.shape[0]}')
+        ##################### chain filter ###############
+        if keep_chains and chain_id not in keep_chains:
+            continue
+        ##################### chain filter ###############
 
-    try:
-        
-        # Workaround for MDtraj not supporting mmcif in their latest release.
-        # MDtraj source does support mmcif https://github.com/mdtraj/mdtraj/issues/652
-        # We temporarily save the mmcif as a pdb and delete it after running mdtraj.
-        p = MMCIFParser()
-        struc = p.get_structure("", mmcif_path)
-        io = PDBIO()
-        io.set_structure(struc)
-        pdb_path = mmcif_path.replace('.cif', '.pdb')
-        io.save(pdb_path)
+        try:
+            # cut out unknown residues of both side
+            modeled_idx = np.where(chain_dict["aatype"] != 20)[0]
+            min_idx = np.min(modeled_idx)
+            max_idx = np.max(modeled_idx)
+            chain_dict = tree.map_structure(
+                lambda x: x[min_idx:(max_idx+1)], chain_dict)
+            chain_length = chain_dict['aatype'].shape[0]
+            chain_dict["residue_index"] = np.arange(0,chain_length)
 
-        # MDtraj
-        traj = md.load(pdb_path)
-        # SS calculation
-        pdb_ss = md.compute_dssp(traj, simplified=True)
-        # DG calculation
-        pdb_dg = md.compute_rg(traj)
-        os.remove(pdb_path)
-    except Exception as e:
-        os.remove(pdb_path)
-        raise errors.DataError(f'Mdtraj failed with error {e}')
+            chains_dict[chain_id] = chain_dict
+        except Exception as e:
+            logging.warning(errors.DataError(f"Error occured during process {mmcif_path} chain {chain_id}\n{e}"))
 
-    chain_dict['ss'] = pdb_ss[0]
-    metadata['coil_percent'] = np.sum(pdb_ss == 'C') / metadata['modeled_seq_len']
-    metadata['helix_percent'] = np.sum(pdb_ss == 'H') / metadata['modeled_seq_len']
-    metadata['strand_percent'] = np.sum(pdb_ss == 'E') / metadata['modeled_seq_len']
 
-    # Radius of gyration
-    metadata['radius_gyration'] = pdb_dg[0]
+    if not chains_dict:
+        raise errors.DataError(f"No protein chains found in {mmcif_path}")
 
+    for assemble_data in assemble_metadatas:
+        try:
+            assemble_data["asym_id_list"] = [chain_id for chain_id in assemble_data["asym_id_list"] if chain_id in chains_dict]
+            if not assemble_data["asym_id_list"]:
+                raise ValueError(f"no chains exists in assemble {assemble_data['assemble_id']}")
+            assemble_chains_dict = [chains_dict[chain_id] for chain_id in assemble_data["asym_id_list"]]
+            assemble_feat_dict = du.concat_np_features(assemble_chains_dict, False)
+            # trasform to pdb
+            pdb_path = mmcif_path.replace('.cif', '.pdb')
+            protein_keys = ["atom_positions", "aatype", "atom_mask", "residue_index", "chain_index", "b_factors"]
+            protein_dict = {k:v for k,v in assemble_feat_dict.items() if k in protein_keys}
+            chain_protein = Protein(**protein_dict)
+            pdb_string = to_pdb(chain_protein)
+            open(pdb_path,"w").write(pdb_string)
+
+            # MDtraj
+            traj = md.load(pdb_path)
+            pdb_ss = md.compute_dssp(traj, simplified=True)
+            pdb_ss = pdb_ss[0]
+            # DG calculation
+            pdb_dg = md.compute_rg(traj)
+            os.remove(pdb_path)
+            metadatas.append({
+                # file level metadata
+                **metadata,
+                # assemble level metadata
+                **assemble_data,
+                # assemble level geometric data
+                'modeled_seq_len' : assemble_feat_dict['aatype'].shape[0],
+                'coil_percent' : np.sum(pdb_ss == 'C') / len(pdb_ss),
+                'helix_percent' : np.sum(pdb_ss == 'H') / len(pdb_ss),
+                'strand_percent' : np.sum(pdb_ss == 'E') / len(pdb_ss),
+                'radius_gyration' : pdb_dg[0],
+
+            })
+        except Exception as e:
+            logging.warning(errors.DataError(f"Error occured during process {mmcif_path} assemble {assemble_data['assemble_id']}\n{e.with_traceback(None)}"))
+    if not metadatas:
+        raise errors.DataError(f"No assemble found in {mmcif_path}")
+    if verbose:
+        logging.info(metadatas)
     # Write features to pickles.
-    du.write_pkl(processed_mmcif_path, complex_feats)
+    du.write_pkl(processed_mmcif_path, chains_dict)
 
     # Return metadata
-    return metadata
+    return metadatas
 
 
 def process_serially(
-        all_mmcif_paths, max_resolution, max_len, write_dir):
+        all_mmcif_paths, max_resolution, write_dir):
     all_metadata = []
     for i, mmcif_path in enumerate(all_mmcif_paths):
-        try:
-            start_time = time.time()
-            metadata = process_mmcif(
-                mmcif_path,
-                max_resolution,
-                max_len,
-                write_dir)
-            elapsed_time = time.time() - start_time
-            print(f'Finished {mmcif_path} in {elapsed_time:2.2f}s')
-            all_metadata.append(metadata)
-        except errors.DataError as e:
-            print(f'Failed {mmcif_path}: {e}')
+        start_time = time.time()
+        metadata = process_mmcif(
+            mmcif_path,
+            max_resolution,
+            write_dir,
+            verbose = True)
+        elapsed_time = time.time() - start_time
+        logging.info(f'Finished {mmcif_path} in {elapsed_time:2.2f}s')
+        all_metadata.append(metadata)
     return all_metadata
 
 
@@ -258,22 +360,19 @@ def process_fn(
         mmcif_path,
         verbose=None,
         max_resolution=None,
-        max_len=None,
         write_dir=None):
     try:
         start_time = time.time()
         metadata = process_mmcif(
-            mmcif_path,
-            max_resolution,
-            max_len,
-            write_dir)
+            mmcif_path= mmcif_path,
+            max_resolution= max_resolution,
+            write_dir= write_dir,
+            verbose = verbose)
         elapsed_time = time.time() - start_time
-        if verbose:
-            print(f'Finished {mmcif_path} in {elapsed_time:2.2f}s')
+        logging.info(f'Finished {mmcif_path} in {elapsed_time:2.2f}s')
         return metadata
     except errors.DataError as e:
-        if verbose:
-            print(f'Failed {mmcif_path}: {e}')
+        logging.info(f'Failed {mmcif_path}: {e}')
 
 
 def main(args):
@@ -294,26 +393,30 @@ def main(args):
     # Process each mmcif file
     if args.num_processes == 1 or args.debug:
         all_metadata = process_serially(
-            all_mmcif_paths,
-            args.max_resolution,
-            args.max_len,
-            write_dir)
+            all_mmcif_paths= all_mmcif_paths,
+            max_resolution= args.max_resolution,
+            write_dir= write_dir)
     else:
         _process_fn = fn.partial(
             process_fn,
             verbose=args.verbose,
             max_resolution=args.max_resolution,
-            max_len=args.max_len,
             write_dir=write_dir)
         # Uses max number of available cores.
         with mp.Pool() as pool:
             all_metadata = pool.map(_process_fn, all_mmcif_paths)
-        all_metadata = [x for x in all_metadata if x is not None]
-    metadata_df = pd.DataFrame(all_metadata)
-    metadata_df.to_csv(metadata_path, index=False)
+            
+    all_metadata = [x for x in all_metadata if x is not None]
     succeeded = len(all_metadata)
     print(
         f'Finished processing {succeeded}/{total_num_paths} files')
+
+    # flatten each file-level metadata to assemble-level metadata
+    flatten_list = lambda lst: [x for sublst in lst for x in (flatten_list(sublst) if isinstance(sublst, list) else [sublst])]
+    flattened_metadata = flatten_list(all_metadata)
+
+    metadata_df = pd.DataFrame(flattened_metadata)
+    metadata_df.to_csv(metadata_path, index=False)
 
 
 if __name__ == "__main__":

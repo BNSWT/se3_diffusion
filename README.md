@@ -1,56 +1,59 @@
 # SE(3) diffusion model with application to protein backbone generation
 
-## Description
+[![standard-readme compliant](https://img.shields.io/badge/SE3%20StrcturePrediction%20-init-green.svg?style=plastic&logo=appveyor)](https://github.com/Wangchentong/se3_diffusion)
+[![standard-readme compliant](https://img.shields.io/badge/SE3%20ComplexDiffusion%20-init-green.svg?style=plastic&logo=appveyor)](https://github.com/Wangchentong/se3_diffusion)
+[![standard-readme compliant](https://img.shields.io/badge/SE3%20MoleculeDiffusion-Proposed-inactive.svg?style=plastic&logo=appveyor)](https://github.com/Wangchentong/se3_diffusion)
+
 Implementation for "SE(3) diffusion model with application to protein backbone generation" [arxiv link](https://arxiv.org/abs/2302.02277).
-While our work is tailored towards protein backbone generation, it is in principle applicable to other domains where SE(3) is utilized.
 
-> For those interested in non-protein applications, we have prepared a minimal notebook with SO(3) diffusion
-> https://colab.research.google.com/github/blt2114/SO3_diffusion_example/blob/main/SO3_diffusion_example.ipynb 
-
-We have codebase updates we plan to get around to.
-
-* [In the works] Refactor score framework to be more readable and match the paper's math. See the [refactor branch](https://github.com/jasonkyuyim/se3_diffusion/tree/unsupported_refactor).
-* Set-up easily downloadable training data.
-
-We welcome pull requests (especially bug fixes) and contributions.
-We will try out best to improve readability and answer questions!
-
-If you use our work then please cite
-```
-@article{yim2023se,
-  title={SE (3) diffusion model with application to protein backbone generation},
-  author={Yim, Jason and Trippe, Brian L and De Bortoli, Valentin and Mathieu, Emile and Doucet, Arnaud and Barzilay, Regina and Jaakkola, Tommi},
-  journal={arXiv preprint arXiv:2302.02277},
-  year={2023}
-}
-```
+Code based on official github repo [SE3 Diffusion](https://github.com/jasonkyuyim/se3_diffusion/)
 
 
-Other protein diffusion codebases:
-* Pretrained protein backbone diffusion: [RFdiffusion](https://github.com/RosettaCommons/RFdiffusion)
-* Protein-ligand docking: [DiffDock](https://github.com/gcorso/DiffDock)
-* Protein torsion angles: [FoldingDiff](https://github.com/microsoft/foldingdiff/)
-* Protein C-alpha backbone generation: [ProtDiff/SMCDiff](https://github.com/blt2114/ProtDiff_SMCDiff)
+## Table of Contents
 
-LICENSE: MIT
-
-![framediff-landing-page](https://github.com/jasonkyuyim/se3_diffusion/blob/master/media/denoising.gif)
-
-# Table of Contents
-- [SE(3) diffusion model with application to protein backbone generation](#se3-diffusion-model-with-application-to-protein-backbone-generation)
-  - [Description](#description)
-- [Table of Contents](#table-of-contents)
-- [Installation](#installation)
-    - [Third party source code](#third-party-source-code)
-- [Inference](#inference)
+- [Background](#background)
+- [Install](#install)
+- [Dataset Preparation](#dataset-preparation)
+	- [Standard Diffusion Data](#standard-diffusion-data)
+	- [Structure Prediction Data](#structure-prediction-data)
 - [Training](#training)
-    - [Downloading the PDB for training](#downloading-the-pdb-for-training)
-    - [Launching training](#launching-training)
-    - [Intermittent evaluation](#intermittent-evaluation)
-- [Acknowledgements](#acknowledgements)
+  - [Standard Diffusion Training](#standard-diffusion-training)
+<!--   - [Structure Prediction Training](#structure-prediction-training) -->
+- [Inference](#inference)
+  - [Standard Diffusion Inference](#standard-diffusion-inference)
+<!--   - [Structure Prediction Inference](#structure-prediction-inference) -->
+- [Related Efforts](#related-efforts)
+- [Maintainers](#maintainers)
+- [Contributing](#contributing)
+- [License](#license)
 
+## Background
 
-# Installation
+Standard Readme started with the issue originally posed by [@maxogden](https://github.com/maxogden) over at [feross/standard](https://github.com/feross/standard) in [this issue](https://github.com/feross/standard/issues/141), about whether or not a tool to standardize readmes would be useful. A lot of that discussion ended up in [zcei's standard-readme](https://github.com/zcei/standard-readme/issues/1) repository. While working on maintaining the [IPFS](https://github.com/ipfs) repositories, I needed a way to standardize Readmes across that organization. This specification started as a result of that.
+
+> Your documentation is complete when someone can use your module without ever
+having to look at its code. This is very important. This makes it possible for
+you to separate your module's documented interface from its internal
+implementation (guts). This is good because it means that you are free to
+change the module's internals as long as the interface remains the same.
+
+> Remember: the documentation, not the code, defines what a module does.
+
+~ [Ken Williams, Perl Hackers](http://mathforum.org/ken/perl_modules.html#document)
+
+Writing READMEs is way too hard, and keeping them maintained is difficult. By offloading this process - making writing easier, making editing easier, making it clear whether or not an edit is up to spec or not - you can spend less time worrying about whether or not your initial documentation is good, and spend more time writing and using code.
+
+By having a standard, users can spend less time searching for the information they want. They can also build tools to gather search terms from descriptions, to automatically run example code, to check licensing, and so on.
+
+The goals for this repository are:
+
+1. A well defined **specification**. This can be found in the [Spec document](spec.md). It is a constant work in progress; please open issues to discuss changes.
+2. **An example README**. This Readme is fully standard-readme compliant, and there are more examples in the `example-readmes` folder.
+3. A **linter** that can be used to look at errors in a given Readme. Please refer to the [tracking issue](https://github.com/RichardLitt/standard-readme/issues/5).
+4. A **generator** that can be used to quickly scaffold out new READMEs. See [generator-standard-readme](https://github.com/RichardLitt/generator-standard-readme).
+5. A **compliant badge** for users. See [the badge](#badge).
+
+## Install
 
 We recommend [miniconda](https://docs.conda.io/en/main/miniconda.html) (or anaconda).
 Run the following to install a conda environment with the necessary dependencies.
@@ -63,166 +66,169 @@ Next, we recommend installing our code as a package. To do this, run the followi
 pip install -e .
 ```
 
-### Third party source code
+[Pyrosetta](https://graylab.jhu.edu/download/PyRosetta4/archive/release/) is recommended to install for best performance of mpnn sequence design, {Username} {Password} of License can be obtained [here](https://els2.comotion.uw.edu/product/pyrosetta)
+```
+aria2c https://{Username}:{Password}@graylab.jhu.edu/download/PyRosetta4/archive/release/PyRosetta4.Release.python39.linux/PyRosetta4.Release.python39.linux.release-342.tar.bz2
 
-Our repo keeps a fork of [OpenFold](https://github.com/aqlaboratory/openfold) since we made a few changes to the source code.
-Likewise, we keep a fork of [ProteinMPNN](https://github.com/dauparas/ProteinMPNN).
-Each of these codebases are actively under development and you may want to refork.
-We use copied and adapted several files from the [AlphaFold](https://github.com/deepmind/alphafold) primarily in `/data/`, and have left the DeepMind license at the top of these files.
-For a differentiable pytorch implementation of the Logarithmic map on SO(3) we adapted two functions form [geomstats](https://github.com/geomstats/geomstats).
-Go give these repos a star if you use this codebase!
+tar -xvjf PyRosetta4.Release.python39.linux.release-342.tar.bz2
 
-# Inference
+conda activate se3
 
-`inference_se3_diffusion.py` is the inference script. It utilizes [Hydra](https://hydra.cc).
-Training can be done with the following.
-```python
+cd PyRosetta4.Release.python39.linux.release-342
+
+python setup/setup.py install
+```
+
+## Dataset Preparation
+
+
+### Standard Diffusion Data
+
+```sh
+rsync -rlpt -v -z --delete --port=33444 rsync.rcsb.org::ftp_data/structures/divided/mmCIF/ ./data/mmCIF
+
+gzip -d ./data/mmCIF/**/*.gz
+
+wget https://ftp.pdbj.org/pub/pdb/data/status/obsolete.dat  ./strcture_prediction/data/mmCIF/
+
+python data/process_pdb_dataset.py --mmcif_dir ./mmCIF --num_processes 20
+```
+
+See the script for more options. Each mmCIF will be written as a pickle file that we read and process in the data loading pipeline. A metadata.csv will be saved that contains unique assemble unit defined by [pdbx_struct_assembly](https://mmcif.wwpdb.org/dictionaries/mmcif_pdbx_v50.dic/Categories/pdbx_struct_assembly.html) in each mmcif file.
+
+### Structure Prediction Data
+
+Download templates of each PDB single chain
+```sh
+# install aws
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+
+./aws/install --bin-dir ~/bin --install-dir ~/local/aws-cli --update
+
+# Download OpenProteinSet pdb templates data
+mkdir strcture_prediction/OpenProteinSet/
+
+aws s3 sync --no-sign-request s3://openfold/pdb/ ./strcture_prediction/OpenProteinSet/ --exclude "**/**.a3m"
+```
+Process OpenProteinSet templates file with data/mmCIF cif file.   
+```sh
+python structure_prediction/data/process_pdb_dataset.py --num_processes 20 
+```
+it shoulbe noted that **Standard Diffusion Data** suggested to be prepared brefore process strcture prediction data. As it save template release date cache in data/metadata.csv. This cache can boost at least 2 times speed up.
+
+## Training
+
+### Standard Diffusion Training
+Train scaffold generation model with 4 gpu in DDP mode, log with W&B
+```sh
+torchrun --nproc_per_node 4 experiments/train_se3_diffusion.py experiment.num_gpus=4 experiment.use_ddp=True experiment.use_wandb=True
+```
+<!-- ### Structure Prediction Training -->
+
+## Inference
+
+### Standard Diffusion Inference
+
+```sh
 python experiments/inference_se3_diffusion.py
 ```
-The config for inference is in `config/inference.yaml`.
-See the config for different inference options.
-By default, inference will use the published paper weights in `weights/paper_weights.pth`.
-Simply change the `weights_path` to use your custom weights.
+if Pyrosetta is installed, following config can be used to improve scaffold generation quality
 ```yaml
+# ./data/inference.yaml
 inference:
-    weights_path: <path>
+  mpnn:
+    # if use ca_mpnn weights
+    ca_only : False
+    # Whether optimize backbone by rosetta fades
+    fades : False
+    # Relax cycle for each scaffold, min cycle is 1 for sidechain pack, 0 will only give sequence
+    cycle : 1
+    # Select best quence of multi sample sequences on current scaffold based on mpnn score rather than direct sample one sequence
+    best_selection:
+      switch_on : False
+      sample_nums : 32
+    # whether dump full-atom protein after mpnn sequence design
+    dump: True
+    # Look more config in this file
 ```
-Samples will be saved to `output_dir` in the `inference.yaml`. By default it is
-set to `./inference_outputs/`. Sample outputs will be saved as follows,
-
+Inference output wuold be like
 ```shell
 inference_outputs
 └── 12D_02M_2023Y_20h_46m_13s           # Date time of inference.
     ├── inference_conf.yaml             # Config used during inference.
-    └── length_100                      # Sampled length 
-        ├── sample_0                    # Sample ID for length
-        │   ├── bb_traj_1.pdb           # x_{t-1} diffusion trajectory
-        │   ├── sample_1.pdb            # Final sample
-        │   ├── self_consistency        # Self consistency results        
-        │   │   ├── esmf                # ESMFold predictions using ProteinMPNN sequences
-        │   │   │   ├── sample_0.pdb
-        │   │   │   ├── sample_1.pdb
-        │   │   │   ├── sample_2.pdb
-        │   │   │   ├── sample_3.pdb
-        │   │   │   ├── sample_4.pdb
-        │   │   │   ├── sample_5.pdb
-        │   │   │   ├── sample_6.pdb
-        │   │   │   ├── sample_7.pdb
-        │   │   │   └── sample_8.pdb
-        │   │   ├── parsed_pdbs.jsonl   # Parsed chains for ProteinMPNN
-        │   │   ├── sample_1.pdb
-        │   │   ├── sc_results.csv      # Summary metrics CSV 
-        │   │   └── seqs                
-        │   │       └── sample_1.fa     # ProteinMPNN sequences
-        │   └── x0_traj_1.pdb           # x_0 model prediction trajectory
-        └── sample_1                    # Next sample
+    ├── mpnn.fasta                      # mpnn designed seuences.
+    ├── self_consistency.csv            # self consistency analysis, contains rmsd and tmscore between scaffold ans esmfold, mpnn score of sequence, scaffold path, esmf path etc.
+    ├── diffusion                       # dir contains scaffold generated by framediff
+    │    ├── 100_1_sample.pdb          
+    │    ├── 100_2_sample.pdb           # {length}_{sample_id}_sample.pdb
+    |    └── ...
+    ├── trajctory                       # dir contains traj pdb, exists when inference.option.save_trajactory=True
+    │    ├── 100_1_bb_traj.pdb          
+    │    ├── 100_2_bb_traj.pdb          # {length}_{sample_id}_traj.pdb
+    |    └── ...
+    ├── movie                           # dir contains full atom protein designed by mpnn, exists when inference.option.plot.switch_on=True
+    │    ├── 100_1_rigid_movie.gif      # movie of protein rigid at time t    
+    │    ├── 100_1_rigid_0_movie.gif    # movie of predict protein rigid at time 0 from time t  
+    |    └── ...
+    ├── mpnn                            # dir exists when pyrosetta in installed and inference.mpnn.dump=True
+    │    ├── 100_0_sample_mpnn_0.pdb      
+    │    ├── 100_0_sample_mpnn_1.pdb    # {length}_{sample_id}_sample_mpnn_{sequence_id}.pdb
+    |    └── ... 
+    └── esmf                            # dir contians esmf predict strcture
+         ├── 100_0_sample_esmf_0.pdb     
+         ├── 100_0_sample_esmf_0.pdb     # {length}_{sample_id}_sample_esmf_{sequence_id}.pdb
+         └── ... 
+
 ```
 
-# Training
+A naive benchmark of a couple of parameter combination(more combination strategy will be updated)
+```sh
+# higher inference.cpu_num can boost speed of pyrosetta scaffold optimization by multiprocessing
+baseline : python experiments/inference_se3_diffusion.py
 
-### Downloading the PDB for training
-To get the training dataset, first download PDB then preprocess it with our provided scripts.
-PDB can be downloaded from RCSB: https://www.wwpdb.org/ftp/pdb-ftp-sites#rcsbpdb.
-Our scripts assume you download in **mmCIF format**.
-Navigate down to "Download Protocols" and follow the instructions depending on your location.
+baseline_ca : python experiments/inference_se3_diffusion.py inference.name=baseline_ca_only inference.mpnn.ca_only=True
 
-> WARNING: Downloading PDB can take up to 1TB of space.
+cycle_3 : python experiments/inference_se3_diffusion.py inference.name=mpnn_cycle_3 inference.mpnn.cycle=3 inference.cpu_num=14
 
-After downloading, you should have a directory formatted like this:
-https://files.rcsb.org/pub/pdb/data/structures/divided/mmCIF/ 
-```
-00/
-01/
-02/
-..
-zz/
-```
-In this directory, unzip all the files: 
-```
-gzip -d **/*.gz
-```
-Then run the following with <path_pdb_dir> replaced with the location of PDB.
-```python
-python process_pdb_dataset.py --mmcif_dir <pdb_dir> 
-```
-See the script for more options. Each mmCIF will be written as a pickle file that
-we read and process in the data loading pipeline. A `metadata.csv` will be saved
-that contains the pickle path of each example as well as additional information
-about each example for faster filtering.
+cycle_3_best_selection : python experiments/inference_se3_diffusion.py inference.name=mpnn_cycle_3_best_selection inference.mpnn.cycle=3 inference.mpnn.best_selection.switch_on=True inference.cpu_num=14
 
-For PDB files, we provide some starter code in `process_pdb_files.py`  of how to
-modify `process_pdb_dataset.py` to work with PDB files (as we did at an earlier
-point in the project). **This has not been tested.** Please make a pull request
-if you create a PDB file processing script. 
-
-### Launching training 
-`train_se3_diffusion.py` is the training script. It utilizes [Hydra](https://hydra.cc).
-Hydra does a nice thing where it will save the output, config, and overrides of each run to the `outputs/` directory organized by date and time. By default we use 2 GPUs to fit proteins up to length 512. The number of GPUs can be changed with the `num_gpus` field in `base.yml`.
-
-Training can be done with the following.
-```python
-python experiments/train_se3_diffusion.py
-```
-The config for training is in `config/base.yaml`.
-See the config for different training options.
-Training will write losses and additional information in the terminal.
-
-We support wandb which can be turned on by setting the following option in the config.
-
-```yaml
-experiment:
-    use_wandb: True
+cycle_3_fades : python experiments/inference_se3_diffusion.py inference.name=mpnn_cycle_3_fades inference.mpnn.cycle=3 inference.mpnn.fades=True inference.cpu_num=14
 ```
 
-Multi-run can be achieved with the `-m` flag. The config must specify the sweep.
-For an example, in `config/base.yaml` we can have the following:
-```yaml
-defaults:
-  - override hydra/launcher: joblib
+<div align="center">
+  <img src="https://github.com/Wangchentong/se3_diffusion/assets/91596060/a1056108-c656-40b1-af8c-b3ea957e4de3" alt="mpnn_pyrosetta">
+</div>
 
-hydra:
-  sweeper:
-    params:
-      model.node_embed_size: 128,256
-```
-This instructs hydra to use [joblib](https://joblib.readthedocs.io/en/latest/)
-as a pipeline for launching a sweep over `data.rosetta.filtering.subset` for two
-different values. You can specify a swep with the `-m` flag. The training script
-will automatically decide which GPUs to use for each sweep. You have to make sure
-enough GPUs are available on your server.
+<!-- ### Structure Prediction Inference -->
 
-```python
-python experiments/train_se3_diffusion.py -m
-```
-Each training run outputs the following.
-* Model checkpoints are saved to `ckpt`.
-* Hydra logging is saved to `outputs/` including configs and overrides.
-* Samples during intermittent evaluation (see next section) are saved to `eval_outputs`.
-* Wandb outputs are saved to `wandb`.
+## Related Efforts
 
-### Intermittent evaluation
+- [FrameDiff](https://github.com/jasonkyuyim/se3_diffusion) - 💌 The Base Code of this repo.
+- [Openfold](https://github.com/aqlaboratory/openfold) - 💵 The Base model and OpenProteinSet dataset Provider.
+- [ProteinMPNN](https://github.com/dauparas/ProteinMPNN) - ♥ The sequence design model.
+- [DL_binder_design](https://github.com/nrbennet/dl_binder_design) 📨 The ProteinMPNN-Pyrosetta optimization method.
+- [ESMFold](https://github.com/facebookresearch/esm) 🔦 The structure prediction model.
 
-Training also performs evaluation everytime a checkpoint is saved.
-We select equally spaced lengths between the minimum and maximum lengths seen during training and sample multiple backbones for each length.
-These are then evaluated with different metrics such as secondary structure composition, radius of gyration, chain breaks, and clashes.
+## Maintainers
 
-> We additionally evaluate TM-score of the sample with a selected example from the training set.
-> This was part of a older research effort for something like protein folding.
-> We keep this since it'll likely be useful to others but it can be ignored for 
-> the task of unconditional generation.
+[@Wangchentong](https://github.com/Wangchenton).
 
-All samples and their metrics can be visualized in wandb (if it was turned on).
-The terminal will print the paths to which the checkpoint and samples are saved.
-```bash
-[2023-02-09 15:10:25,097][__main__][INFO] - Checkpoints saved to: <ckpt_path>
-[2022-02-09 15:10:25,097][__main__][INFO] - Evaluation saved to: <sample_path>
-```
-This can also be found in the config in Wandb by searching `ckpt_dir`.
-Once you have a good run, you can copy and save the weights somewhere for inference.
+## Contributing
 
-# Acknowledgements
+Feel free to join in this repo! [Open an issue](https://github.com/Wangchentong/se3_diffusion/issues/new) or submit PRs.
 
-Thank you to the following for pointing out bugs:
-* longlongman
-* amorehead
+### Contributors
 
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+
+
+## License
+
+[MIT](LICENSE) © Wang Chentong

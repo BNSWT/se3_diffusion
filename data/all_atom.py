@@ -173,6 +173,30 @@ def compute_backbone(bb_rigids, psi_torsions):
     atom37_mask = torch.any(atom37_bb_pos, axis=-1)
     return atom37_bb_pos, atom37_mask, aatype, atom14_pos
 
+def compute_sidechain(bb_rigids, psi_torsions):
+    torsion_angles = torch.tile(
+        psi_torsions[..., None, :],
+        tuple([1 for _ in range(len(bb_rigids.shape))]) + (7, 1)
+    ).to(bb_rigids.device)
+    aatype = torch.zeros(bb_rigids.shape).long()
+    # aatype = torch.zeros(bb_rigids.shape).long().to(bb_rigids.device)
+    all_frames = feats.torsion_angles_to_frames(
+        bb_rigids,
+        torsion_angles,
+        aatype,
+        DEFAULT_FRAMES.to(bb_rigids.device))
+    atom14_pos = frames_to_atom14_pos(
+        all_frames,
+        aatype)
+    atom37_bb_pos = torch.zeros(bb_rigids.shape + (37, 3))
+    # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
+    # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
+    atom37_bb_pos[..., :3, :] = atom14_pos[..., :3, :]
+    atom37_bb_pos[..., 3, :] = atom14_pos[..., 4, :] 
+    atom37_bb_pos[..., 4, :] = atom14_pos[..., 3, :]
+    atom37_mask = torch.any(atom37_bb_pos, axis=-1)
+    return atom37_bb_pos, atom37_mask, aatype, atom14_pos
+
 
 def calculate_neighbor_angles(R_ac, R_ab):
     """Calculate angles between atoms c <- a -> b.

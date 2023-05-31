@@ -6,6 +6,8 @@ from typing import List, Dict, Any
 import collections
 from omegaconf import OmegaConf
 import dataclasses
+import functools
+import tree
 from data import chemical
 from data import residue_constants
 from data import protein
@@ -19,7 +21,10 @@ import io
 import gzip
 from torch.utils import data
 import torch
-
+from enum import Enum
+import random
+import functools as fn
+import logging
 Protein = protein.Protein
 
 # Global map from chain characters to integers.
@@ -32,20 +37,42 @@ INT_TO_CHAIN = {
 }
 
 CHAIN_FEATS = [
-    'atom_positions', 'aatype', 'atom_mask', 'residue_index', 'b_factors'
+    # origin
+    'atom_positions', 'aatype', 'atom_mask', 'residue_index', 'b_factors',
+    # rename origin feature
+    'all_atom_positions','atom37_atom_exists',
+    # for torsion loss
+    'torsion_angles_sin_cos','chi_mask',
+    # for structure prediction
+    'residx_atom14_to_atom37',
+    'residue_index','res_mask','atom37_pos','atom37_mask','atom14_pos',
+    # for sidechain atom rename and fape loss of sidechain(which use atom14 rather than atom37)
+    'atom14_gt_exists','atom14_gt_position','atom14_alt_gt_exists','atom14_alt_gt_positions',
+    'atom14_atom_exists','atom14_atom_is_ambiguous',
 ]
+TEMPLATE_FEATURES = [
+    "template_mask","template_aatype","template_pseudo_beta","template_pseudo_beta_mask",
+    "template_all_atom_mask","template_all_atom_positions","template_torsion_angles_mask",
+    "template_torsion_angles_sin_cos","template_alt_torsion_angles_sin_cos","template_sum_probs",
+]
+
 UNPADDED_FEATS = [
-    't', 'rot_score_scaling', 'trans_score_scaling', 't_seq', 't_struct'
+    't', 'rot_score_scaling', 'trans_score_scaling', 't_seq', 't_struct', "template_sum_probs","template_mask",
 ]
 RIGID_FEATS = [
-    'rigids_0', 'rigids_t'
+    'rigids_0', 'rigids_t',"rigids_all_0"
 ]
 PAIR_FEATS = [
     'rel_rots'
 ]
 
 
-move_to_np = lambda x: x.cpu().detach().numpy()
+# quaternary_category definition
+class quaternary_category(Enum):
+    HOMOMER = 'homomer'
+    HETEROMER = 'heteromer'
+
+move_to_np = lambda x: x.cpu().detach().numpy() if isinstance(x,torch.Tensor) else x
 aatype_to_seq = lambda aatype: ''.join([
         residue_constants.restypes_with_x[x] for x in aatype])
 
@@ -122,11 +149,17 @@ def parse_pdb_lines(lines):
 
 def chain_str_to_int(chain_str: str):
     chain_int = 0
-    if len(chain_str) == 1:
-        return CHAIN_TO_INT[chain_str]
     for i, chain_char in enumerate(chain_str):
-        chain_int += CHAIN_TO_INT[chain_char] + (i * len(ALPHANUMERIC))
+        chain_int = CHAIN_TO_INT[chain_char] + chain_int * len(ALPHANUMERIC)
     return chain_int
+
+def chain_int_to_str(chain_int: int):
+    chain_str = ""
+    while chain_int >0:
+        chain_str = chain_str + INT_TO_CHAIN[chain_int % len(ALPHANUMERIC)]
+        chain_int = chain_int // len(ALPHANUMERIC)
+    
+    return chain_str
 
 def parse_pdb_feats(
         pdb_name: str,
@@ -156,7 +189,7 @@ def parse_pdb_feats(
         chain_dict = dataclasses.asdict(chain_prot)
 
         # Process features
-        feat_dict = {x: chain_dict[x] for x in CHAIN_FEATS}
+        feat_dict = {x: chain_dict[x] for x in CHAIN_FEATS if x in chain_dict}
         return parse_chain_feats(
             feat_dict, scale_factor=scale_factor)
 
@@ -197,31 +230,45 @@ def matrix_to_rotvec(mat):
 def rotvec_to_quat(rotvec):
     return Rotation.from_rotvec(rotvec).as_quat()
 
-def pad_feats(raw_feats, max_len, use_torch=False):
+def pad_feats(raw_feats, max_len, use_torch=False,max_templates=None):
     padded_feats = {
         feat_name: pad(feat, max_len, use_torch=use_torch)
         for feat_name, feat in raw_feats.items()
-        if feat_name not in UNPADDED_FEATS + RIGID_FEATS
+        if feat_name not in UNPADDED_FEATS + RIGID_FEATS + TEMPLATE_FEATURES
     }
-    for feat_name in PAIR_FEATS:
-        if feat_name in padded_feats:
-            padded_feats[feat_name] = pad(padded_feats[feat_name], max_len, pad_idx=1)
+
+    # pad from raw feature
+    for feat_name in TEMPLATE_FEATURES:
+        if feat_name in raw_feats:
+            if feat_name not in UNPADDED_FEATS:
+                padded_feats[feat_name] = pad(raw_feats[feat_name], max_len, pad_idx=1,use_torch=use_torch)
+        if max_templates:
+            padded_feats[feat_name] = pad(padded_feats[feat_name], max_templates, pad_idx=0,use_torch=use_torch)
     for feat_name in UNPADDED_FEATS:
         if feat_name in raw_feats:
             padded_feats[feat_name] = raw_feats[feat_name]
     for feat_name in RIGID_FEATS:
         if feat_name in raw_feats:
+            # why rigid need to pad with identity?
             padded_feats[feat_name] = pad_rigid(raw_feats[feat_name], max_len)
+
+    # pad from padded feature, mean it's a second pad for pair
+    for feat_name in PAIR_FEATS:
+        if feat_name in padded_feats:
+            padded_feats[feat_name] = pad(padded_feats[feat_name], max_len, pad_idx=1,use_torch=use_torch)
     return padded_feats
 
 def pad_rigid(rigid: torch.tensor, max_len: int):
     num_rigids = rigid.shape[0]
     pad_amt = max_len - num_rigids
+    if pad_amt<=0:
+        return rigid
+    shape = (pad_amt,) + tuple(rigid.shape[1:-1])
     pad_rigid = rigid_utils.Rigid.identity(
-        (pad_amt,), dtype=rigid.dtype, device=rigid.device, requires_grad=False)
+        shape, dtype=rigid.dtype, device=rigid.device, requires_grad=False)
     return torch.cat([rigid, pad_rigid.to_tensor_7()], dim=0)
 
-def pad(x: np.ndarray, max_len: int, pad_idx=0, use_torch=False, reverse=False):
+def pad(x, max_len: int, pad_idx=0, use_torch=False, reverse=False):
     """Right pads dimension of numpy array.
 
     Args:
@@ -238,14 +285,93 @@ def pad(x: np.ndarray, max_len: int, pad_idx=0, use_torch=False, reverse=False):
     pad_amt = max_len - seq_len
     pad_widths = [(0, 0)] * x.ndim
     if pad_amt < 0:
-        raise ValueError(f'Invalid pad amount {pad_amt}')
+        return x
     if reverse:
         pad_widths[pad_idx] = (pad_amt, 0)
     else:
         pad_widths[pad_idx] = (0, pad_amt)
     if use_torch:
-        return torch.pad(x, pad_widths)
+        pad_widths.reverse()
+        return torch.nn.functional.pad(x, [i for pad_width in pad_widths for i in pad_width])
     return np.pad(x, pad_widths)
+
+def crop(x: torch.Tensor, crop_len: int, crop_start : int, crop_idx :int = 0):
+    slices = [slice(0,length) for length in x.shape]
+    crop_start = max(min(crop_start,slices[crop_idx].stop-crop_len),0)
+    crop_end = min(slices[crop_idx].stop,crop_start+crop_len)
+    slices[crop_idx] = slice(crop_start,crop_end)
+    x = x[slices]
+    return x
+
+
+def crop_feats(
+    raw_feats, crop_size, max_templates=None,subsample_templates=False
+):
+    """Crop randomly to `crop_size`, or keep as is if shorter than that."""
+    # We want each ensemble to be cropped the same way
+    device = raw_feats["aatype"].device
+
+    seq_length = raw_feats["aatype"].shape[0]
+
+    if "template_mask" in raw_feats:
+        num_templates = sum(raw_feats["template_mask"] == 1)
+    else:
+        num_templates = 0
+
+    # No need to subsample templates if there aren't any
+    subsample_templates = subsample_templates and num_templates
+
+    num_res_crop_size = min(int(seq_length), crop_size)
+
+    def _randint(lower, upper):
+        return int(torch.randint(
+                lower,
+                upper + 1,
+                (1,),
+                device=device,
+        )[0])
+
+    if subsample_templates:
+        templates_crop_start = _randint(0, num_templates)
+        templates_select_indices = torch.randperm(
+            num_templates, device=device
+        )
+        num_templates_crop_size = min(
+            num_templates - templates_crop_start, max_templates
+        )
+        templates_select_indices = templates_select_indices[templates_crop_start:templates_crop_start+num_templates_crop_size]
+    else:
+        templates_select_indices = []
+    n = seq_length - num_res_crop_size
+    x = _randint(0, n)
+    right_anchor = n - x
+
+    num_res_crop_start = _randint(0, right_anchor)
+
+    cropped_feats = {
+        feat_name: crop(feat, crop_len = num_res_crop_size, crop_start = num_res_crop_start,crop_idx = 0)
+        for feat_name, feat in raw_feats.items()
+        if feat_name not in UNPADDED_FEATS + TEMPLATE_FEATURES
+    }
+    for feat_name in TEMPLATE_FEATURES:
+        if feat_name in raw_feats:
+            if subsample_templates:
+                cropped_feats[feat_name] = raw_feats[feat_name][templates_select_indices]
+            if feat_name not in UNPADDED_FEATS:
+                cropped_feats[feat_name] = crop(cropped_feats[feat_name], crop_len = num_res_crop_size, crop_start = num_res_crop_start,crop_idx = 1)
+    
+    for feat_name in UNPADDED_FEATS:
+        if feat_name in raw_feats:
+            cropped_feats[feat_name] = raw_feats[feat_name]
+
+    for feat_name in PAIR_FEATS:
+        if feat_name in cropped_feats:
+            cropped_feats[feat_name] = crop(raw_feats[feat_name], crop_len = num_res_crop_size, crop_start = num_res_crop_start,crop_idx = 1)
+
+    
+    return cropped_feats
+
+
 
 # read A3M and convert letters into
 # integers in the 0..20 range,
@@ -390,6 +516,7 @@ def length_batching(
     ):
     get_len = lambda x: x['res_mask'].shape[0]
     dicts_by_length = [(get_len(x), x) for x in np_dicts]
+    random.shuffle(dicts_by_length)
     length_sorted = sorted(dicts_by_length, key=lambda x: x[0], reverse=True)
     max_len = length_sorted[0][0]
     max_batch_examples = int(max_squared_res // max_len**2)
@@ -398,8 +525,25 @@ def length_batching(
         pad_example(x) for (_, x) in length_sorted[:max_batch_examples]]
     return torch.utils.data.default_collate(padded_batch)
 
+def pad_and_crop(data_conf,raw_prots):
+    processed_prots = []
+    fix_size = max([prot["aatype"].shape[0] for prot in raw_prots])
+
+    for prot in raw_prots:
+        init_feats = tree.map_structure(lambda x: x if torch.is_tensor(x) else torch.tensor(x), prot)
+        # print("init feature : ",{k:v.shape for k,v in init_feats.items()})
+        padded_feats = pad_feats(init_feats, fix_size,use_torch=True)
+        # print("after padding : ",{k:v.shape for k,v in padded_feats.items()})
+        if data_conf.crop:
+            cropped_feats = crop_feats(padded_feats, data_conf.crop_size,data_conf.max_templates,data_conf.subsample_templates)
+        # print("after cropping : ",{k:v.shape for k,v in cropped_feats.items()})
+        processed_prots.append(cropped_feats)
+    return processed_prots
+
+
 def create_data_loader(
         torch_dataset: data.Dataset,
+        data_conf,
         batch_size,
         shuffle,
         sampler=None,
@@ -408,15 +552,19 @@ def create_data_loader(
         max_squared_res=1e6,
         length_batch=False,
         drop_last=False,
-        prefetch_factor=2):
+        prefetch_factor=2,
+        seed=0):
     """Creates a data loader with jax compatible data structures."""
+    # this collate fn should not 
     if np_collate:
         collate_fn = lambda x: concat_np_features(x, add_batch_dim=True)
     elif length_batch:
         collate_fn = lambda x: length_batching(
             x, max_squared_res=max_squared_res)
     else:
-        collate_fn = None
+        collate_fn = torch.utils.data.default_collate
+    _pad_and_crop = functools.partial(pad_and_crop,data_conf=data_conf)
+    collate_fn_final = lambda x : collate_fn(_pad_and_crop(raw_prots=x))
     persistent_workers = True if num_workers > 0 else False
     prefetch_factor = 2 if num_workers == 0 else prefetch_factor
     return data.DataLoader(
@@ -424,16 +572,22 @@ def create_data_loader(
         sampler=sampler,
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_final,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
         drop_last=drop_last,
         # Need fork https://github.com/facebookresearch/hydra/issues/964
         multiprocessing_context='fork' if num_workers != 0 else None,
+        # set deterministic for worker
+        worker_init_fn=worker_init_function
         )
 
 def parse_chain_feats(chain_feats, scale_factor=1.):
+
+    if chain_feats["chain_index"].dtype.kind in {'U', 'S'}:
+        chain_feats["chain_index"] = np.vectorize(chain_str_to_int)(chain_feats["chain_index"])
+   
     ca_idx = residue_constants.atom_order['CA']
     chain_feats['bb_mask'] = chain_feats['atom_mask'][:, ca_idx]
     bb_pos = chain_feats['atom_positions'][:, ca_idx]
@@ -612,3 +766,55 @@ def save_fasta(
     with open(file_path, 'w') as f:
         for x,y in zip(seq_names, pred_seqs):
             f.write(f'>{x}\n{y}\n')
+
+# set seed at main fucntion and each dataloader worker
+def seed_everything(seed: int = None) -> int:
+
+    log = logging.getLogger(__name__)
+
+    max_seed_value = np.iinfo(np.uint32).max
+    min_seed_value = np.iinfo(np.uint32).min
+    if seed is None:
+        seed = random.randint(min_seed_value, max_seed_value)
+        logging.info(f"No seed found, seed set to {seed}")
+    elif not isinstance(seed, int):
+        seed = int(seed)
+
+    if not (min_seed_value <= seed <= max_seed_value):
+        logging.warn(f"{seed} is not in bounds, numpy accepts from {min_seed_value} to {max_seed_value}")
+        seed = random.randint(min_seed_value, max_seed_value)
+
+    # using `log.info` instead of `rank_zero_info`,
+    # so users can verify the seed is properly set in distributed training.
+    log.info(f"Global seed set to {seed}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    return seed
+
+def worker_init_function(worker_id: int) -> None:  # pragma: no cover
+    """The worker_init_fn that Lightning automatically adds to your dataloader if you previously set the seed with
+    ``seed_everything(seed, workers=True)``.
+
+    See also the PyTorch documentation on
+    `randomness in DataLoaders <https://pytorch.org/docs/stable/notes/randomness.html#dataloader>`_.
+    """
+    # implementation notes: https://github.com/pytorch/pytorch/issues/5059#issuecomment-817392562
+    global_rank = 0
+    process_seed = torch.initial_seed()
+    # back out the base seed so we can use all the bits
+    base_seed = process_seed - worker_id
+    logging.debug(
+        f"Initializing random number generators of process {global_rank} worker {worker_id} with base seed {base_seed}"
+    )
+    ss = np.random.SeedSequence([base_seed, worker_id, global_rank])
+    # use 128 bits (4 x 32-bit words)
+    np.random.seed(ss.generate_state(4))
+    # Spawn distinct SeedSequences for the PyTorch PRNG and the stdlib random module
+    torch_ss, stdlib_ss = ss.spawn(2)
+    torch.manual_seed(torch_ss.generate_state(1, dtype=np.uint64)[0])
+    # use 128 bits expressed as an integer
+    stdlib_seed = (stdlib_ss.generate_state(2, dtype=np.uint64).astype(object) * [1 << 64, 1]).sum()
+    random.seed(stdlib_seed)

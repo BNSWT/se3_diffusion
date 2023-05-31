@@ -162,19 +162,26 @@ def to_pdb(prot: Protein, model=1, add_end=True) -> str:
   aatype = prot.aatype
   atom_positions = prot.atom_positions
   residue_index = prot.residue_index.astype(int)
-  chain_index = prot.chain_index.astype(int)
   b_factors = prot.b_factors
 
   if np.any(aatype > residue_constants.restype_num):
     raise ValueError('Invalid aatypes.')
 
   # Construct a mapping from chain integer indices to chain ID strings.
+  # Add support for prot.chain_index.dtype is string
   chain_ids = {}
-  for i in np.unique(chain_index):  # np.unique gives sorted output.
-    if i >= PDB_MAX_CHAINS:
-      raise ValueError(
-          f'The PDB format supports at most {PDB_MAX_CHAINS} chains.')
-    chain_ids[i] = PDB_CHAIN_IDS[i]
+  if prot.chain_index.dtype.kind in 'U':
+    chain_index = np.zeros_like(prot.chain_index, dtype=int)
+    for index,chain_name in enumerate(np.unique(prot.chain_index)):
+      chain_index[prot.chain_index == chain_name] = index
+      chain_ids[index] = chain_name
+  else:
+    chain_index = prot.chain_index
+    for i in np.unique(chain_index):  # np.unique gives sorted output.
+      if i >= PDB_MAX_CHAINS:
+        raise ValueError(
+            f'The PDB format supports at most {PDB_MAX_CHAINS} chains.')
+      chain_ids[i] = PDB_CHAIN_IDS[i]
 
   pdb_lines.append(f'MODEL     {model}')
   atom_index = 1

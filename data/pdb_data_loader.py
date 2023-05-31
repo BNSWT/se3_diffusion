@@ -72,14 +72,48 @@ class PdbDataset(data.Dataset):
         return self._data_conf
 
     def _init_metadata(self):
-        """Initialize metadata."""
+        """
+        Initialize metadata
+
+        2023.5.31 UPDATED
+        Property:
+        # file level metadata
+            pdb_name - pdb name
+            processed_path - pkl path of processed feature
+            raw_path - raw protein path
+            resolution - resolution
+            structure_method - x-ray diffraction ...etc
+            release_date - release date of this cif, boost speed of template featurize in structure_prediction/data/templates.py
+            
+        # assemble level metadata
+            assemble_id - (pdb_name,assemble_id) is the unique key of each row
+            details - author_defined_assembly, software_defined_assembly ...etc, mitght considered to be a filter?
+            oligomeric_details - monomeric, dimeric ...etc
+            oligomeric_count - chains exists in this assemble
+            oper_expression - currently only "1", other oper expression is filtered by data/process_pdb_dataset.py 
+            asym_id_list - chain_ids exists in this assemble
+            modeled_seq_len - total complex residue nums
+
+        # assemble level geometric feature
+        - all features below calculate soely based on this assemble strcture
+        - which means the feature can be different by caculate each chain individually
+        - eg, beta strand can form on chain-chain interface and clasp in single chain state
+        - useful feature for dssp conditioned tranning
+            coil_percent - coil_percent
+            helix_percent - helix_percent
+            strand_percent - strand_percent
+            radius_gyration - radius_gyration
+        
+        """
 
         # Process CSV with different filtering criterions.
+
+
         filter_conf = self.data_conf.filtering
         pdb_csv = pd.read_csv(self.data_conf.csv_path)
         self.raw_csv = pdb_csv
         if filter_conf.allowed_oligomer is not None and len(filter_conf.allowed_oligomer) > 0:
-            pdb_csv = pdb_csv[pdb_csv.oligomeric_detail.isin(
+            pdb_csv = pdb_csv[pdb_csv.oligomeric_details.isin(
                 filter_conf.allowed_oligomer)]
         if filter_conf.max_len is not None:
             pdb_csv = pdb_csv[pdb_csv.modeled_seq_len <= filter_conf.max_len]
@@ -130,28 +164,26 @@ class PdbDataset(data.Dataset):
                 f'Validation: {len(self.csv)} examples with lengths {eval_lengths}')
     # cache make the same sample in same batch 
     @fn.lru_cache(maxsize=100)
-    def _process_csv_row(self, processed_file_path):
-        processed_feats = du.read_pkl(processed_file_path)
-        processed_feats = du.parse_chain_feats(processed_feats)
+    def _process_csv_row(self, processed_file_path , asym_id_list):
+        # reverse serialized asym_id_list
+        asym_id_list = [e.strip(" '[]") for e in asym_id_list.split(',')]
 
-        # Only take modeled residues.
-        modeled_idx = processed_feats['modeled_idx']
-        min_idx = np.min(modeled_idx)
-        max_idx = np.max(modeled_idx)
-        del processed_feats['modeled_idx']
-        processed_feats = tree.map_structure(
-            lambda x: x[min_idx:(max_idx+1)], processed_feats)
+        chains_dict = du.read_pkl(processed_file_path)
+
+        assemble_feats = du.concat_np_features([chains_dict[chain_id] for chain_id in asym_id_list], False)
+        
+        processed_feats = du.parse_chain_feats(assemble_feats)
 
         # Run through OpenFold data transforms.
-        chain_feats = {
+        assemble_feats = {
             'aatype': torch.tensor(processed_feats['aatype']).long(),
             'all_atom_positions': torch.tensor(processed_feats['atom_positions']).double(),
             'all_atom_mask': torch.tensor(processed_feats['atom_mask']).double()
         }
-        chain_feats = data_transforms.atom37_to_frames(chain_feats)
-        chain_feats = data_transforms.make_atom14_masks(chain_feats)
-        chain_feats = data_transforms.make_atom14_positions(chain_feats)
-        chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
+        assemble_feats = data_transforms.atom37_to_frames(assemble_feats)
+        assemble_feats = data_transforms.make_atom14_masks(assemble_feats)
+        assemble_feats = data_transforms.make_atom14_positions(assemble_feats)
+        assemble_feats = data_transforms.atom37_to_torsion_angles()(assemble_feats)
 
         # Re-number residue indices for each chain such that it starts from 1.
         # Randomize chain indices.
@@ -173,17 +205,17 @@ class PdbDataset(data.Dataset):
 
         # To speed up processing, only take necessary features
         final_feats = {
-            'aatype': chain_feats['aatype'],
+            'aatype': assemble_feats['aatype'],
             'seq_idx': new_res_idx,
             'chain_idx': new_chain_idx,
-            'residx_atom14_to_atom37': chain_feats['residx_atom14_to_atom37'],
+            'residx_atom14_to_atom37': assemble_feats['residx_atom14_to_atom37'],
             'residue_index': processed_feats['residue_index'],
             'res_mask': processed_feats['bb_mask'],
-            'atom37_pos': chain_feats['all_atom_positions'],
-            'atom37_mask': chain_feats['all_atom_mask'],
-            'atom14_pos': chain_feats['atom14_gt_positions'],
-            'rigidgroups_0': chain_feats['rigidgroups_gt_frames'],
-            'torsion_angles_sin_cos': chain_feats['torsion_angles_sin_cos'],
+            'atom37_pos': assemble_feats['all_atom_positions'],
+            'atom37_mask': assemble_feats['all_atom_mask'],
+            'atom14_pos': assemble_feats['atom14_gt_positions'],
+            'rigidgroups_0': assemble_feats['rigidgroups_gt_frames'],
+            'torsion_angles_sin_cos': assemble_feats['torsion_angles_sin_cos'],
         }
         return final_feats
 
@@ -229,7 +261,8 @@ class PdbDataset(data.Dataset):
         else:
             raise ValueError('Need chain identifier.')
         processed_file_path = csv_row['processed_path']
-        chain_feats = self._process_csv_row(processed_file_path)
+        asym_id_list = csv_row['asym_id_list']
+        assemble_feats = self._process_csv_row(processed_file_path,asym_id_list)
 
         # Use a fixed seed for evaluation.
         if self.is_training:
@@ -238,14 +271,14 @@ class PdbDataset(data.Dataset):
             rng = np.random.default_rng(idx)
 
         gt_bb_rigid = rigid_utils.Rigid.from_tensor_4x4(
-            chain_feats['rigidgroups_0'])[:, 0]
-        diffused_mask = np.ones_like(chain_feats['res_mask'])
+            assemble_feats['rigidgroups_0'])[:, 0]
+        diffused_mask = np.ones_like(assemble_feats['res_mask'])
         if np.sum(diffused_mask) < 1:
             raise ValueError('Must be diffused')
         fixed_mask = 1 - diffused_mask
-        chain_feats['fixed_mask'] = fixed_mask
-        chain_feats['rigids_0'] = gt_bb_rigid.to_tensor_7()
-        chain_feats['sc_ca_t'] = torch.zeros_like(gt_bb_rigid.get_trans())
+        assemble_feats['fixed_mask'] = fixed_mask
+        assemble_feats['rigids_0'] = gt_bb_rigid.to_tensor_7()
+        assemble_feats['sc_ca_t'] = torch.zeros_like(gt_bb_rigid.get_trans())
 
         # Sample t and diffuse.
         if self.is_training:
@@ -263,12 +296,12 @@ class PdbDataset(data.Dataset):
                 diffuse_mask=None,
                 as_tensor_7=True,
             )
-        chain_feats.update(diff_feats_t)
-        chain_feats['t'] = t
+        assemble_feats.update(diff_feats_t)
+        assemble_feats['t'] = t
 
         # Convert all features to tensors.
         final_feats = tree.map_structure(
-            lambda x: x if torch.is_tensor(x) else torch.tensor(x), chain_feats)
+            lambda x: x if torch.is_tensor(x) else torch.tensor(x), assemble_feats)
         final_feats = du.pad_feats(final_feats, csv_row['modeled_seq_len'])
         if self.is_training:
             return final_feats
@@ -377,7 +410,7 @@ class DistributedTrainSampler(data.Sampler):
                 batch_size,
                 num_replicas: Optional[int] = None,
                 rank: Optional[int] = None, shuffle: bool = True,
-                seed: int = 0, drop_last: bool = False) -> None:
+                seed: int = 0, drop_last: bool = False,copy_num : int = None) -> None:
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError("Requires distributed package to be available")
@@ -395,8 +428,9 @@ class DistributedTrainSampler(data.Sampler):
         self._data_csv = self._dataset.csv
         self._dataset_indices = list(range(len(self._data_csv)))
         self._data_csv['index'] = self._dataset_indices
+        self._copy_num = copy_num if copy_num else batch_size
         # _repeated_size is the size of the dataset multiply by batch size
-        self._repeated_size = batch_size * len(self._data_csv)
+        self._repeated_size = batch_size * len(self._data_csv) if copy_num is None else copy_num * len(self._data_csv)
         self._batch_size = batch_size
         self.num_replicas = num_replicas
         self.rank = rank
@@ -415,7 +449,7 @@ class DistributedTrainSampler(data.Sampler):
             self.num_samples = math.ceil(self._repeated_size / self.num_replicas)  # type: ignore[arg-type]
         self.total_size = self.num_samples * self.num_replicas
         self.shuffle = shuffle
-        self.seed = seed
+        self.seed = seed if seed is not None else 0
 
     def __iter__(self) :
         if self.shuffle:
@@ -427,7 +461,7 @@ class DistributedTrainSampler(data.Sampler):
             indices = list(range(len(self._data_csv)))  # type: ignore[arg-type]
 
         # indices is expanded by self._batch_size times
-        indices = np.repeat(indices, self._batch_size)
+        indices = np.repeat(indices, self._copy_num)
         
         if not self.drop_last:
             # add extra samples to make it evenly divisible
