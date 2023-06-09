@@ -3,11 +3,49 @@ import torch
 import math
 from torch import nn
 from torch.nn import functional as F
+import torch.utils.checkpoint
 from data import utils as du
 from data import all_atom
 from model import ipa_pytorch
 import functools as fn
-
+from openfold.model.primitives import Attention
+from openfold.model.template import (
+    LightTemplatePairStackBlock,
+    TemplatePointwiseAttention,
+)
+from openfold.model.pair_transition import PairTransition
+from openfold.model.embedders import (
+    TemplateAngleEmbedder,
+    TemplatePairEmbedder,
+)
+from openfold.model.msa import (
+    MSAAttention
+)
+from openfold.utils.tensor_utils import (
+    permute_final_dims,
+)
+from openfold.np.residue_constants import (
+    restype_rigid_group_default_frame,
+    restype_atom14_to_rigid_group,
+    restype_atom14_mask,
+    restype_atom14_rigid_group_positions,
+    atom_order,
+    resname_to_idx,
+    STANDARD_ATOM_MASK
+)
+from openfold.utils.feats import (
+    frames_and_literature_positions_to_atom14_pos,
+    torsion_angles_to_frames,
+    atom14_to_atom37,
+    pseudo_beta_fn,
+    build_template_angle_feat,
+    build_template_pair_feat,
+    atom14_to_atom37,
+)
+from openfold.utils.tensor_utils import (
+    dict_multimap,
+    tensor_tree_map,
+)
 Tensor = torch.Tensor
 
 
@@ -53,28 +91,45 @@ class Embedder(nn.Module):
         self._model_conf = model_conf
         self._embed_conf = model_conf.embed
 
+        # output dimension
+        node_embed_size = self._model_conf.node_embed_size
+        edge_embed_size = self._model_conf.edge_embed_size
+
         # Time step embedding
-        index_embed_size = self._embed_conf.index_embed_size
-        t_embed_size = index_embed_size
-        node_embed_dims = t_embed_size + 1
-        edge_in = (t_embed_size + 1) * 2
+        node_in = self._embed_conf.t_embed_size + 1
+        edge_in = (self._embed_conf.t_embed_size + 1) * 2
 
         # Sequence index embedding
-        node_embed_dims += index_embed_size
-        edge_in += index_embed_size
+        if self._embed_conf.index_embed_size:
+            self.index_embedder = fn.partial(
+                get_index_embedding,
+                embed_size=self._embed_conf.index_embed_size
+            )
+            node_in += self._embed_conf.index_embed_size
+            edge_in += self._embed_conf.index_embed_size
+        # relative embedding
+        if self._embed_conf.rel_pos_emded_size:
+            self.rel_pos_embedder = PositinalEmbedder(max_relative_idx=self._embed_conf.rel_pos_emded_size)
+            edge_in += self.rel_pos_embedder.no_bins
 
-        node_embed_size = self._model_conf.node_embed_size
+        # self-condition embedding
+        if self._embed_conf.embed_self_conditioning == 'baseline':
+            edge_in += self._embed_conf.no_bins
+        elif self._embed_conf.embed_self_conditioning == 'template':
+            self.template_embedder = TemplateEmbedder(self._embed_conf.template)
+        elif not self._embed_conf.embed_self_conditioning:
+            pass
+        else:
+            raise ValueError(f"self_condition embedder : {self._embed_conf.embed_self_conditioning} is not implemented")
+        
         self.node_embedder = nn.Sequential(
-            nn.Linear(node_embed_dims, node_embed_size),
+            nn.Linear(node_in, node_embed_size),
             nn.ReLU(),
             nn.Linear(node_embed_size, node_embed_size),
             nn.ReLU(),
             nn.Linear(node_embed_size, node_embed_size),
             nn.LayerNorm(node_embed_size),
         )
-
-        if self._embed_conf.embed_self_conditioning:
-            edge_in += self._embed_conf.num_bins
         edge_embed_size = self._model_conf.edge_embed_size
         self.edge_embedder = nn.Sequential(
             nn.Linear(edge_in, edge_embed_size),
@@ -87,11 +142,7 @@ class Embedder(nn.Module):
 
         self.timestep_embedder = fn.partial(
             get_timestep_embedding,
-            embedding_dim=self._embed_conf.index_embed_size
-        )
-        self.index_embedder = fn.partial(
-            get_index_embedding,
-            embed_size=self._embed_conf.index_embed_size
+            embedding_dim=self._embed_conf.t_embed_size
         )
 
     def _cross_concat(self, feats_1d, num_batch, num_res):
@@ -103,10 +154,10 @@ class Embedder(nn.Module):
     def forward(
             self,
             *,
-            seq_idx,
+            batch,
             t,
             fixed_mask,
-            self_conditioning_ca,
+            self_condition=None,
         ):
         """Embeds a set of inputs
 
@@ -114,13 +165,13 @@ class Embedder(nn.Module):
             seq_idx: [..., N] Positional sequence index for each residue.
             t: Sampled t in [0, 1].
             fixed_mask: mask of fixed (motif) residues.
-            self_conditioning_ca: [..., N, 3] Ca positions of self-conditioning
-                input.
+            self_condition: Mapping [str,Tensor] contains 'rigids' of prev step
 
         Returns:
             node_embed: [B, N, D_node]
             edge_embed: [B, N, N, D_edge]
         """
+        seq_idx = batch['seq_idx']
         num_batch, num_res = seq_idx.shape
         node_feats = []
 
@@ -133,25 +184,473 @@ class Embedder(nn.Module):
         pair_feats = [self._cross_concat(prot_t_embed, num_batch, num_res)]
 
         # Positional index features.
-        node_feats.append(self.index_embedder(seq_idx))
-        rel_seq_offset = seq_idx[:, :, None] - seq_idx[:, None, :]
-        rel_seq_offset = rel_seq_offset.reshape([num_batch, num_res**2])
-        pair_feats.append(self.index_embedder(rel_seq_offset))
+        if self._embed_conf.index_embed_size:
+            node_feats.append(self.index_embedder(seq_idx))
+            rel_seq_offset = seq_idx[:, :, None] - seq_idx[:, None, :]
+            rel_seq_offset = rel_seq_offset.reshape([num_batch, num_res**2])
+            pair_feats.append(self.index_embedder(rel_seq_offset))
+        
+        # Relative position embedding
+        if self._embed_conf.rel_pos_emded_size:
+            pair_feats.append(self.rel_pos_embedder(batch).reshape([num_batch, num_res**2, -1]))
 
         # Self-conditioning distogram.
-        if self._embed_conf.embed_self_conditioning:
+        if self._embed_conf.embed_self_conditioning == 'baseline':
             sc_dgram = du.calc_distogram(
-                self_conditioning_ca,
+                torch.zeros_like(batch["rigids_t"][...,:4]) if not self_condition else self_condition["rigids"],
                 self._embed_conf.min_bin,
                 self._embed_conf.max_bin,
-                self._embed_conf.num_bins,
+                self._embed_conf.no_bins,
             )
             pair_feats.append(sc_dgram.reshape([num_batch, num_res**2, -1]))
 
         node_embed = self.node_embedder(torch.cat(node_feats, dim=-1).float())
         edge_embed = self.edge_embedder(torch.cat(pair_feats, dim=-1).float())
         edge_embed = edge_embed.reshape([num_batch, num_res, num_res, -1])
+
+        if self._embed_conf.embed_self_conditioning == 'template':
+            #### template embed and self-condition embed ####
+            seq_mask = batch["res_mask"].float()
+            pair_mask = seq_mask[...,:,None] * seq_mask[...,None,:]
+            template_batch = {k:v for k,v in batch.items() if 'template_' in k} if "template_mask" in batch and batch["template_mask"].any() else None
+            template_node_embed,template_edge_embed = self.template_embedder(
+                node_embed=node_embed,
+                edge_embed=edge_embed,
+                pair_mask=pair_mask,
+                template_batch=template_batch,
+                self_condition=self_condition,
+                )
+            node_embed = node_embed + template_node_embed
+            edge_embed = edge_embed + template_edge_embed
+
         return node_embed, edge_embed
+
+class PositinalEmbedder(nn.Module):
+    """
+    Embeds a subset of the input features.
+
+    Implements Algorithms 3 (InputEmbedder) and 4 (relpos).
+    """
+    def __init__(
+        self,
+        max_relative_idx: int,
+        **kwargs,
+    ):
+        """
+        Args:
+            c_z:
+                Pair embedding dimension
+            relpos_k:
+                Window size used in relative positional encoding
+        """
+        super(PositinalEmbedder, self).__init__()
+
+        # RPE stuff
+        self.max_relative_idx = max_relative_idx
+        self.no_bins = 2 * max_relative_idx + 2 + 2
+
+    def forward(self, batch):
+        def one_hot(x, v_bins):
+            reshaped_bins = v_bins.view(((1,) * len(x.shape)) + (len(v_bins),))
+            diffs = x[..., None] - reshaped_bins
+            am = torch.argmin(torch.abs(diffs), dim=-1)
+            return nn.functional.one_hot(am, num_classes=len(v_bins)).float()
+        pos = batch["residue_index"]
+        chain_index = batch["chain_idx"]
+        chain_index_same = (chain_index[..., None] == chain_index[..., None, :])
+        asym_id = batch["asym_id"] if "asym_id" in batch else batch["chain_idx"]
+        asym_id_same = (asym_id[..., None] == asym_id[..., None, :])
+        offset = pos[..., None] - pos[..., None, :]
+
+        # intra chain relative positional encoding, same asym_id share same relative position
+        clipped_offset = torch.clamp(
+            offset + self.max_relative_idx, 0, 2 * self.max_relative_idx
+        )
+        clipped_offset = torch.where(
+            asym_id_same, 
+            clipped_offset,
+            (2 * self.max_relative_idx + 1) * 
+            torch.ones_like(clipped_offset)
+        )
+        rel_feats = []
+        
+        boundaries = torch.arange(
+            start=0, end=2 * self.max_relative_idx + 2, device=clipped_offset.device
+        )
+        rel_pos = one_hot(
+            clipped_offset, boundaries,
+        )
+        rel_feats.append(rel_pos)
+
+        # inter chain positional encoding, only 0 or 1
+        chain_offset = torch.where(
+            chain_index_same,  
+            torch.ones_like(clipped_offset),
+            torch.zeros_like(clipped_offset)
+        )
+        chain_boundaries = torch.arange(start=0,end=2,device=clipped_offset.device)
+        chain_rel_pos = one_hot(
+            chain_offset, chain_boundaries,
+        )
+        rel_feats.append(chain_rel_pos)
+
+        rel_feats = torch.concat(rel_feats,dim=-1).float()
+
+        return rel_feats
+
+class TemplateColumnWiseAttention(nn.Module):
+    def __init__(self, c_in, c_hidden, no_heads, inf=1e9):
+        super(TemplateColumnWiseAttention, self).__init__()
+        self.c_in = c_in
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.inf = inf
+        self.mha = Attention(
+            self.c_in,
+            self.c_in,
+            self.c_in,
+            self.c_hidden,
+            self.no_heads,
+            gating=True,
+        )
+    def forward(self, t, s,template_mask):
+        bias = self.inf * (template_mask[..., None, None, None, :] - 1)
+
+        # [*, N_res, 1, C_s]
+        s = s.unsqueeze(-2)
+        # [*, N_temp, N_res,  C_s] => [*, N_res, N_temp, C_s]
+        t = permute_final_dims(t, ( 1, 0, 2))
+
+        # [*, N_res, 1, C_s]
+        biases = [bias]
+        s = self.mha(q_x=s, kv_x=t, biases=biases)
+
+        # [*, N_res, C_s]
+        s = s.squeeze(-2)
+
+        return s
+class TemplateCrossEmbedder(nn.Module):
+    """
+    A naive fixup for misssing msa block
+    Cross information of z,template_pair by point wise attention
+    Cross information of s,template_angle by column wise attention
+    input:
+        t_s
+        t_z
+        s
+        z
+
+    """
+            
+    def __init__(
+        self,
+        config,
+    ):
+        super(TemplateCrossEmbedder, self).__init__()
+        self.template_pointwise_att = TemplatePointwiseAttention(**config.template_pointwise_attention)
+        self.template_columnwise_attention = TemplateColumnWiseAttention(**config.template_column_wise_attention)
+
+    def forward(self,t_s,t_z,s,z,template_mask):
+
+        s = self.template_columnwise_attention(t_s,s,template_mask)
+        z = self.template_pointwise_att(t_z,z,template_mask)
+        return s,z
+
+class TemplateEmbedder(nn.Module):
+    def __init__(self, template_config):
+
+        super(TemplateEmbedder, self).__init__()  
+        self.config = template_config
+        self.self_condition_s = nn.Linear(template_config.c_s,template_config.c_s)
+        self.self_condition_z = nn.Linear(template_config.c_z,template_config.c_t)
+        self.template_angle_embedder = TemplateAngleEmbedder(**template_config.template_angle_embedder)
+        self.template_pair_embedder = TemplatePairEmbedder(**template_config.template_pair_embedder)
+        self.template_pair_stack = LightTemplatePairStackBlock(**template_config.template_pair_stack)
+        self.template_cross_embedder = TemplateCrossEmbedder(template_config.template_cross_embedder)
+
+    def forward(self,node_embed,edge_embed,pair_mask,template_batch=None,self_condition=None,):
+        
+        embeded_templates = []
+
+        if template_batch:
+            embeded_templates.append(self.template_embed(template_batch, pair_mask))
+        if self_condition:
+            embeded_templates.append(self.self_condition_embed(self_condition, pair_mask))
+        if len(embeded_templates)>0:
+            template_embed = dict_multimap(
+                fn.partial(torch.cat, dim=1),embeded_templates
+            )
+            template_embed["template_pair_embedding"]  = torch.utils.checkpoint.checkpoint(fn.partial(self.template_pair_stack,mask=pair_mask[:,None]),template_embed["template_pair_embedding"],use_reentrant=False)
+            t_s,t_z = self.template_cross_embedder(
+                t_s = template_embed["template_angle_embedding"],
+                t_z = template_embed["template_pair_embedding"],
+                s= node_embed,
+                z= edge_embed,
+                template_mask = template_embed["template_mask"])
+            return t_s,t_z
+        else:
+            return torch.zeros_like(node_embed),torch.zeros_like(edge_embed)
+        
+    def template_embed(self, batch, pair_mask): 
+
+        # Discripency : AF2 and Openfold emded template amgle feature into msa feature, which do not exist in our model.
+        # To avoid lost information of template angle, we add a light weight axial attention like msa transformer to embed template torsion into sequence embedding. 
+        # Embed the templates one at a time (with a poor man's vmap)
+        template_embeds = []
+        n_batch,n_templ,n_res = batch["template_aatype"].shape[0:3]
+
+        for i in range(n_templ):
+            if batch["template_mask"][:,i].sum() == 0:
+                template_embeds.append({
+                    "angle" : torch.zeros([n_batch,1,n_res,self.config.c_s],device=pair_mask.device).detach(),
+                    "pair" : torch.zeros([n_batch,1,n_res,n_res,self.config.c_t],device=pair_mask.device).detach(),
+                })
+                continue
+            idx = batch["template_aatype"].new_tensor(i)
+            single_template_feats = tensor_tree_map(
+                lambda t: torch.index_select(t, 1, idx),
+                batch,
+            )
+
+            single_template_embeds = {}
+
+            template_angle_feat = build_template_angle_feat(
+                single_template_feats,
+            )
+
+            # [*, S_t, N, C_m]
+            a = self.template_angle_embedder(template_angle_feat)
+
+            single_template_embeds["angle"] = a
+
+            # [*, S_t, N, N, C_t]
+            t = build_template_pair_feat(
+                single_template_feats,
+                inf=self.config.inf,
+                eps=self.config.eps,
+                **self.config.distogram,
+            ).to(dtype=torch.float)
+
+            t = self.template_pair_embedder(t)
+
+            single_template_embeds.update({"pair": t})
+
+            template_embeds.append(single_template_embeds)
+
+        template_embeds = dict_multimap(
+            fn.partial(torch.cat, dim=1),
+            template_embeds,
+        )
+        # template_embeds["pair"] = template_embeds["pair"] + self.template_pair_stack(template_embeds["pair"],pair_mask[:,None])
+
+        # [*, S_t, N, N, C_z]
+        # template_embeds["pair"] = self.template_pair_stack(
+        #     template_embeds["pair"], 
+        #     pair_mask.unsqueeze(-3).to(dtype=torch.float), 
+        #     chunk_size = None
+        # )
+
+        ret = {
+            "template_pair_embedding": template_embeds['pair'],
+            "template_angle_embedding": template_embeds["angle"],
+            "template_mask" : batch["template_mask"]
+        }
+
+        return ret
+    def self_condition_embed(self, out,pair_mask): 
+        
+        batch_size,res_num = out["final_atom_positions"].shape[:2]
+
+        self_condition_embeds = {}
+        
+        aatype = None
+        if self.config.self_condition.aatype=='atom_mask_match':
+            # [21, 37]
+            standard_atom_mask =  out["final_atom_positions"].new_tensor(STANDARD_ATOM_MASK)
+            # [B, N, 1, 37]
+            all_atom_mask_expanded = out["final_atom_mask"][...,None,:]
+            # [B, N, 21, 37]
+            aatype = torch.argmax(torch.eq(all_atom_mask_expanded, standard_atom_mask)[...,0].float(),dim=-1)
+            out["final_atom_mask"] = standard_atom_mask[aatype]
+            out["final_atom_positions"] = out["final_atom_positions"]*out["final_atom_mask"][...,None]
+        elif self.config.self_condition.aatype=='mask':
+            standard_atom_mask =  out["final_atom_positions"].new_tensor(STANDARD_ATOM_MASK)
+            aatype = torch.ones([batch_size,res_num],dtype=torch.long,device=pair_mask.device)*resname_to_idx['GLY']
+            out["final_atom_mask"] = standard_atom_mask[aatype]
+            out["final_atom_positions"] = out["final_atom_positions"]*out["final_atom_mask"][...,None]
+        else:
+            raise ValueError(f"self_condition aatype : {self.config.self_condition.aatype} is not implemented")
+        
+        torsion_angles, torsion_mask = all_atom.prot_to_torsion_angles(
+            aatype,out["final_atom_positions"],out["final_atom_mask"])
+        pseudo_beta , pseudo_beta_mask = pseudo_beta_fn(aatype,out["final_atom_positions"],out["final_atom_mask"])
+        
+        condition_feats = {
+            "template_aatype" : aatype,
+            "template_all_atom_positions" : out["final_atom_positions"],
+            "template_all_atom_mask" : out["final_atom_mask"],
+            "template_pseudo_beta" : pseudo_beta,
+            "template_pseudo_beta_mask" : pseudo_beta_mask,
+            "template_torsion_angles_sin_cos" : torsion_angles,
+            "template_alt_torsion_angles_sin_cos" : torsion_angles,
+            "template_torsion_angles_mask" : torsion_mask,
+        }
+
+        if  "node_embed" in out and "edge_embed" in out:
+            condition_feats.update({
+                "node_embed" : out["node_embed"],
+                "edge_embed" : out["edge_embed"]
+            })
+
+        condition_feats = tensor_tree_map(lambda x : x[:,None,...],condition_feats)
+
+        template_angle_feat = build_template_angle_feat(
+            condition_feats,
+        )
+        # [*, S_t, N, C_m]
+        a = self.template_angle_embedder(template_angle_feat)
+
+        self_condition_embeds["angle"] = a
+
+        # [*, S_t, N, N, C_t]
+        t = build_template_pair_feat(
+            condition_feats,
+            inf=self.config.inf,
+            eps=self.config.eps,
+            **self.config.distogram,
+        )
+        self_condition_embeds["pair"] = self.template_pair_embedder(t)
+        
+        # [*, S_t, N, N, C_z]
+        # self_condition_embeds["pair"] = self.template_pair_stack(
+        #     self_condition_embeds["pair"], 
+        #     pair_mask.to(dtype=torch.float), 
+        #     chunk_size = None
+        # )
+        
+        # [B,1]
+        template_mask = torch.ones([batch_size,1]).to(device=pair_mask.device,dtype=torch.float)
+
+
+        if "node_embed" in out and "edge_embed" in condition_feats:
+            self_condition_embeds["angle"] = self_condition_embeds["angle"] + self.self_condition_s(condition_feats["node_embed"])
+            self_condition_embeds["pair"] = self_condition_embeds["pair"] + self.self_condition_z(condition_feats["edge_embed"])
+        
+        ret = {
+            "template_pair_embedding": self_condition_embeds["pair"],
+            "template_angle_embedding": self_condition_embeds["angle"],
+            "template_mask" : template_mask
+        }
+
+        return ret
+
+class FullEmbedder(nn.Module):
+
+    def __init__(self, model_conf):
+        super(FullEmbedder, self).__init__()
+        self._model_conf = model_conf
+
+        aatype_embed_size = self._model_conf.aatype_embed_size
+        t_embed_size = self._model_conf.t_embed_size
+
+        rel_pos_embed_size = 2*self._model_conf.rel_pos_emded_size + 2 + 2
+
+        node_embed_size = self._model_conf.node_embed_size
+        edge_embed_size = self._model_conf.edge_embed_size
+
+        node_in_size = aatype_embed_size + t_embed_size
+        edge_in_size = (aatype_embed_size + t_embed_size)*2  + rel_pos_embed_size + self._model_conf.no_bins
+
+        self.node_embedder = nn.Sequential(
+            nn.Linear(node_in_size, node_embed_size),
+            nn.ReLU(),
+            nn.Linear(node_embed_size, node_embed_size),
+            nn.ReLU(),
+            nn.Linear(node_embed_size, node_embed_size),
+            nn.LayerNorm(node_embed_size),
+        )
+
+        self.edge_embedder = nn.Sequential(
+            nn.Linear(edge_in_size, edge_embed_size),
+            nn.ReLU(),
+            nn.Linear(edge_embed_size, edge_embed_size),
+            nn.ReLU(),
+            nn.Linear(edge_embed_size, edge_embed_size),
+            nn.LayerNorm(edge_embed_size),
+        )
+
+        # TODO add relative position embedding in framdiff transformer because we delete index position embedding here
+        self.rel_pos_embedder = PositinalEmbedder(max_relative_idx=self._model_conf.rel_pos_emded_size)
+
+        self.timestep_embedder = fn.partial(
+            get_timestep_embedding,
+            embedding_dim=t_embed_size
+        )
+        
+        self.template_embedder = TemplateEmbedder(self._model_conf.template)
+        
+
+    def _cross_concat(self, feats_1d, num_batch, num_res):
+        return torch.cat([
+            torch.tile(feats_1d[:, :, None, :], (1, 1, num_res, 1)),
+            torch.tile(feats_1d[:, None, :, :], (1, num_res, 1, 1)),
+        ], dim=-1).float()
+    
+    def forward(
+            self,
+            batch,
+            t,
+            fixed_mask,
+            self_condition = None,
+        ):
+        """Embeds a set of inputs
+
+        Args:
+            batch : input feature.
+            t: Sampled t in [0, 1].
+            fixed_mask: mask of fixed (motif) residues.
+            self_conditioning: Mapping [str,Tensor]
+        Returns:
+            node_embed: [B, N, D_node]
+            edge_embed: [B, N, N, D_edge]
+        """
+        with torch.autograd.profiler.record_function("embedder"):
+            num_batch, num_res = batch["aatype"].shape[:2]
+            seq_mask = batch["res_mask"].float()
+            pair_mask = seq_mask[...,:,None] * seq_mask[...,None,:]
+            node_feats = [
+                torch.nn.functional.one_hot(batch["aatype"], self._model_conf.aatype_embed_size).to(torch.float32),
+                torch.tile(self.timestep_embedder(t)[:, None, :], (1, num_res, 1)),
+            ]
+            node_feats = torch.cat(node_feats, dim=-1).float()
+
+            pair_feats = [
+                self._cross_concat(node_feats, num_batch, num_res),
+                self.rel_pos_embedder(batch),
+                du.calc_distogram(
+                    batch["rigids_t"][...,4:],
+                    self._model_conf.min_bin,
+                    self._model_conf.max_bin,
+                    self._model_conf.no_bins,
+                ).reshape([num_batch, num_res, num_res, -1])
+            ]
+            pair_feats = torch.cat(pair_feats, dim=-1).float()
+            node_embed = self.node_embedder(node_feats)
+            edge_embed = self.edge_embedder(pair_feats)
+            #### template embed and self-condition embed ####
+            template_batch = {k:v for k,v in batch.items() if 'template_' in k} if batch["template_mask"].any() else None
+            template_node_embed,template_edge_embed = self.template_embedder(
+                node_embed=node_embed,
+                edge_embed=edge_embed,
+                pair_mask=pair_mask,
+                template_batch=template_batch,
+                self_condition=self_condition,
+                )
+
+            node_embed = node_embed + template_node_embed
+            edge_embed = edge_embed + template_edge_embed
+        return node_embed, edge_embed
+
 
 
 class ScoreNetwork(nn.Module):
@@ -167,7 +666,7 @@ class ScoreNetwork(nn.Module):
     def _apply_mask(self, aatype_diff, aatype_0, diff_mask):
         return diff_mask * aatype_diff + (1 - diff_mask) * aatype_0
 
-    def forward(self, input_feats):
+    def forward(self, input_feats,self_condition=None):
         """Forward computes the reverse diffusion conditionals p(X^t|X^{t+1})
         for each item in the batch
 
@@ -186,10 +685,10 @@ class ScoreNetwork(nn.Module):
 
         # Initial embeddings of positonal and relative indices.
         init_node_embed, init_edge_embed = self.embedding_layer(
-            seq_idx=input_feats['seq_idx'],
+            batch=input_feats,
             t=input_feats['t'],
             fixed_mask=fixed_mask,
-            self_conditioning_ca=input_feats['sc_ca_t'],
+            self_condition=self_condition,
         )
         edge_embed = init_edge_embed * edge_mask[..., None]
         node_embed = init_node_embed * bb_mask[..., None]
@@ -201,15 +700,214 @@ class ScoreNetwork(nn.Module):
         gt_psi = input_feats['torsion_angles_sin_cos'][..., 2, :]
         psi_pred = self._apply_mask(
             model_out['psi'], gt_psi, 1 - fixed_mask[..., None])
+        rigids_pred = model_out['final_rigids']
+        bb_representations = all_atom.compute_backbone(rigids_pred, psi_pred)
 
         pred_out = {
+            #rigids
+            'rigids' : rigids_pred.to_tensor_7(),
+            # angle feature
             'psi': psi_pred,
+            # score
             'rot_score': model_out['rot_score'],
             'trans_score': model_out['trans_score'],
+            # atom14 for backbone
+            'atom14' : bb_representations[-1].to(rigids_pred.device),
+            # atom37 for backbone
+            'atom37' : bb_representations[0].to(rigids_pred.device)
         }
-        rigids_pred = model_out['final_rigids']
-        pred_out['rigids'] = rigids_pred.to_tensor_7()
-        bb_representations = all_atom.compute_backbone(rigids_pred, psi_pred)
-        pred_out['atom37'] = bb_representations[0].to(rigids_pred.device)
-        pred_out['atom14'] = bb_representations[-1].to(rigids_pred.device)
+        if self._model_conf.sidechain:
+            # sidechain prediction
+            all_frames_to_global = self.torsion_angles_to_frames(
+                model_out['final_rigids'],
+                model_out['angles'],
+                input_feats["aatype"],
+            )
+
+            pred_xyz = self.frames_and_literature_positions_to_atom14_pos(
+                all_frames_to_global,
+                input_feats["aatype"],
+            )
+            final_atom_positions = atom14_to_atom37(
+                pred_xyz, input_feats
+            )
+            pred_out_sidechain = {
+                # rigids [B,N,8,7]
+                'all_rigids' : all_frames_to_global.to_tensor_7(),
+
+                # sidechain fape loss
+                'sidechain_frames' : all_frames_to_global.to_tensor_4x4(),
+                "unnormalized_angles": model_out['unnormalized_angles'],
+                "angles": model_out['angles'],
+                # atom 14
+                'positions' : pred_xyz,
+
+                # atom 37 for atom loss and fape loss
+                "final_atom_positions" : final_atom_positions,
+                "final_atom_mask": input_feats["atom37_atom_exists"],
+            }
+            pred_out.update(pred_out_sidechain)
         return pred_out
+
+
+    def _init_residue_constants(self, float_dtype, device):
+        if not hasattr(self, "default_frames"):
+            self.register_buffer(
+                "default_frames",
+                torch.tensor(
+                    restype_rigid_group_default_frame,
+                    dtype=float_dtype,
+                    device=device,
+                    requires_grad=False,
+                ),
+                persistent=False,
+            )
+        if not hasattr(self, "group_idx"):
+            self.register_buffer(
+                "group_idx",
+                torch.tensor(
+                    restype_atom14_to_rigid_group,
+                    device=device,
+                    requires_grad=False,
+                ),
+                persistent=False,
+            )
+        if not hasattr(self, "atom_mask"):
+            self.register_buffer(
+                "atom_mask",
+                torch.tensor(
+                    restype_atom14_mask,
+                    dtype=float_dtype,
+                    device=device,
+                    requires_grad=False,
+                ),
+                persistent=False,
+            )
+        if not hasattr(self, "lit_positions"):
+            self.register_buffer(
+                "lit_positions",
+                torch.tensor(
+                    restype_atom14_rigid_group_positions,
+                    dtype=float_dtype,
+                    device=device,
+                    requires_grad=False,
+                ),
+                persistent=False,
+            )
+
+    def torsion_angles_to_frames(self, r, alpha, f):
+        # Lazily initialize the residue constants on the correct device
+        self._init_residue_constants(alpha.dtype, alpha.device)
+        # Separated purely to make testing less annoying
+        return torsion_angles_to_frames(r, alpha, f, self.default_frames)
+
+    def frames_and_literature_positions_to_atom14_pos(
+        self, r, f  # [*, N, 8]  # [*, N]
+    ):
+        # Lazily initialize the residue constants on the correct device
+        self._init_residue_constants(r.get_rots().dtype, r.get_rots().device)
+        return frames_and_literature_positions_to_atom14_pos(
+            r,
+            f,
+            self.default_frames,
+            self.group_idx,
+            self.atom_mask,
+            self.lit_positions,
+        )
+    
+class FullAtomScoreNetwork(ScoreNetwork):
+
+    def __init__(self, model_conf, diffuser):
+        super(ScoreNetwork, self).__init__()
+        self._model_conf = model_conf
+
+        self.embedding_layer = FullEmbedder(model_conf.embed)
+        self.diffuser = diffuser
+        self.score_model = ipa_pytorch.IpaScore(model_conf, diffuser)
+
+    def forward(self, input_feats, self_condition = None):
+        """Forward computes the reverse diffusion conditionals p(X^t|X^{t+1})
+        for each item in the batch
+
+        Args:
+            X: the noised samples from the noising process, of shape [Batch, N, D].
+                Where the T time steps are t=1,...,T (i.e. not including the un-noised X^0)
+
+        Returns:
+            model_out: dictionary of model outputs.
+        """
+
+        # Frames as [batch, res, 7] tensors.
+        bb_mask = input_feats['res_mask'].type(torch.float32)  # [B, N]
+        fixed_mask = input_feats['fixed_mask'].type(torch.float32)
+        edge_mask = bb_mask[..., None] * bb_mask[..., None, :]
+
+        # Initial embeddings of positonal and relative indices.
+        init_node_embed, init_edge_embed = self.embedding_layer(
+            batch=input_feats,
+            t=input_feats['t'],
+            fixed_mask=fixed_mask,
+            self_condition=self_condition,
+        )
+        edge_embed = init_edge_embed * edge_mask[..., None]
+        node_embed = init_node_embed * bb_mask[..., None]
+
+        # Run main network
+        model_out = self.score_model(node_embed, edge_embed, input_feats)
+
+        # Psi angle prediction
+        gt_psi = input_feats['torsion_angles_sin_cos'][..., 2, :]
+        psi_pred = self._apply_mask(
+            model_out['psi'], gt_psi, 1 - fixed_mask[..., None])
+        rigids_pred = model_out['final_rigids']
+        bb_representations = all_atom.compute_backbone(rigids_pred, psi_pred)
+
+        pred_out = {
+            #rigids
+            'rigids' : rigids_pred.to_tensor_7(),
+            # angle feature
+            'psi': psi_pred,
+            # score
+            'rot_score': model_out['rot_score'],
+            'trans_score': model_out['trans_score'],
+            # atom14 for backbone
+            'atom14' : bb_representations[-1].to(rigids_pred.device),
+            # atom37 for backbone
+            'atom37' : bb_representations[0].to(rigids_pred.device),
+            # latent embedding
+            'node_embed': model_out['node_embed'],
+            'edge_embed': model_out['edge_embed'],
+        }
+        if self._model_conf.sidechain:
+            # sidechain prediction
+            all_frames_to_global = self.torsion_angles_to_frames(
+                model_out['final_rigids'],
+                model_out['angles'],
+                input_feats["aatype"],
+            )
+
+            pred_xyz = self.frames_and_literature_positions_to_atom14_pos(
+                all_frames_to_global,
+                input_feats["aatype"],
+            )
+            final_atom_positions = atom14_to_atom37(
+                pred_xyz, input_feats
+            )
+            pred_out_sidechain = {
+                # rigids [B,N,8,7]
+                'all_rigids' : all_frames_to_global.to_tensor_7(),
+
+                # sidechain fape loss
+                'sidechain_frames' : all_frames_to_global.to_tensor_4x4(),
+                "unnormalized_angles": model_out['unnormalized_angles'],
+                "angles": model_out['angles'],
+                # atom 14
+                'positions' : pred_xyz,
+
+                # atom 37 for atom loss and fape loss
+                "final_atom_positions" : final_atom_positions,
+                "final_atom_mask": input_feats["atom37_atom_exists"],
+            }
+            pred_out.update(pred_out_sidechain)
+        return pred_out
+

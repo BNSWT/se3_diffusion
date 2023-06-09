@@ -237,7 +237,84 @@ class TemplatePairStackBlock(nn.Module):
         z = torch.cat(single_templates, dim=-4)
 
         return z
+class LightTemplatePairStackBlock(nn.Module):
+    def __init__(
+        self,
+        c_t: int,
+        c_hidden_tri_mul: int,
+        pair_transition_n: int,
+        dropout_rate: float,
+        inf: float,
+        **kwargs,
+    ):
+        super(LightTemplatePairStackBlock, self).__init__()
 
+        self.c_t = c_t
+        self.c_hidden_tri_mul = c_hidden_tri_mul
+        self.pair_transition_n = pair_transition_n
+        self.dropout_rate = dropout_rate
+        self.inf = inf
+
+        self.dropout_row = DropoutRowwise(self.dropout_rate)
+        self.dropout_col = DropoutColumnwise(self.dropout_rate)
+
+        self.tri_mul_out = TriangleMultiplicationOutgoing(
+            self.c_t,
+            self.c_hidden_tri_mul,
+        )
+        self.tri_mul_in = TriangleMultiplicationIncoming(
+            self.c_t,
+            self.c_hidden_tri_mul,
+        )
+
+        self.pair_transition = PairTransition(
+            self.c_t,
+            self.pair_transition_n,
+        )
+        self.layer_norm = LayerNorm(c_t)
+    def forward(self, 
+        z: torch.Tensor, 
+        mask: torch.Tensor, 
+        chunk_size: Optional[int] = None, 
+        _mask_trans: bool = True
+    ):
+        if(mask.shape[-3] == 1):
+            expand_idx = list(mask.shape)
+            expand_idx[-3] = z.shape[-4]
+            mask = mask.expand(*expand_idx)
+        single_templates = [
+            t.unsqueeze(-4) for t in torch.unbind(z, dim=-4)
+        ]
+        single_templates_masks = [
+            m.unsqueeze(-3) for m in torch.unbind(mask, dim=-3)
+        ]
+        for i in range(len(single_templates)):
+            single = single_templates[i]
+            single_mask = single_templates_masks[i]
+            
+            single = single + self.dropout_row(
+                self.tri_mul_out(
+                    single,
+                    mask=single_mask
+                )
+            )
+            single = single + self.dropout_row(
+                self.tri_mul_in(
+                    single,
+                    mask=single_mask
+                )
+            )
+            single = single + self.pair_transition(
+                single,
+                mask=single_mask if _mask_trans else None,
+                chunk_size=chunk_size,
+            )
+
+            single_templates[i] = single
+
+        z = torch.cat(single_templates, dim=-4)
+        z = self.layer_norm(z)
+        return z
 
 class TemplatePairStack(nn.Module):
     """

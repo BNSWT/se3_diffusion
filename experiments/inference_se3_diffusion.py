@@ -39,7 +39,14 @@ from omegaconf import DictConfig, OmegaConf
 from openfold.data import data_transforms
 import esm
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.WARNING,
+    # define this things every time set basic config
+    # define this things every time set basic config
+    format="[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
+    datefmt="%d/%b/%Y %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+    ])
 
 # TODO add waiting time analysis between cpu and gpu to keep balance
 # TODO accomodate mpnn model in main process, it's useful when best_selection is on(large batch size)

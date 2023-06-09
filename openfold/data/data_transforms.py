@@ -98,6 +98,8 @@ def fix_templates_aatype(protein):
         protein["template_aatype"] = torch.gather(
             new_order, 1, index=protein["template_aatype"]
         )
+    else:
+        protein["template_aatype"] = torch.zeros(protein["template_aatype"].shape[:2],dtype=torch.int64).to(device=protein["template_aatype"].device)
 
     return protein
 

@@ -42,13 +42,15 @@ CHAIN_FEATS = [
     # rename origin feature
     'all_atom_positions','atom37_atom_exists',
     # for torsion loss
-    'torsion_angles_sin_cos','chi_mask',
+    'chi_angles_sin_cos','chi_mask','torsion_angles_mask',"torsion_angles_sin_cos"
     # for structure prediction
     'residx_atom14_to_atom37',
-    'residue_index','res_mask','atom37_pos','atom37_mask','atom14_pos',
+    'res_mask','atom37_pos','atom37_mask','atom14_pos',
     # for sidechain atom rename and fape loss of sidechain(which use atom14 rather than atom37)
     'atom14_gt_exists','atom14_gt_position','atom14_alt_gt_exists','atom14_alt_gt_positions',
-    'atom14_atom_exists','atom14_atom_is_ambiguous',
+    'atom14_atom_exists','atom14_atom_is_ambiguous',"rigidgroups_gt_exists","rigidgroups_gt_frames","rigidgroups_alt_gt_frames"
+    # for complex rel pos encoding
+    'chain_index'
 ]
 TEMPLATE_FEATURES = [
     "template_mask","template_aatype","template_pseudo_beta","template_pseudo_beta_mask",
@@ -59,9 +61,11 @@ TEMPLATE_FEATURES = [
 UNPADDED_FEATS = [
     't', 'rot_score_scaling', 'trans_score_scaling', 't_seq', 't_struct', "template_sum_probs","template_mask",
 ]
+UNPADDED_FEATS.extend(["self_condition_"+i for i in UNPADDED_FEATS])
 RIGID_FEATS = [
     'rigids_0', 'rigids_t',"rigids_all_0"
 ]
+RIGID_FEATS.extend(["self_condition_"+i for i in RIGID_FEATS])
 PAIR_FEATS = [
     'rel_rots'
 ]
@@ -237,19 +241,27 @@ def pad_feats(raw_feats, max_len, use_torch=False,max_templates=None):
         if feat_name not in UNPADDED_FEATS + RIGID_FEATS + TEMPLATE_FEATURES
     }
 
-    # pad from raw feature
+    # TEMPLATE_FEATURES (PADDED and UNPADDED)
     for feat_name in TEMPLATE_FEATURES:
+
         if feat_name in raw_feats:
+            if max_templates:
+                padded_feat = pad(raw_feats[feat_name], max_templates, pad_idx=0,use_torch=use_torch)
+            else:
+                padded_feat = raw_feats[feat_name]
+
             if feat_name not in UNPADDED_FEATS:
-                padded_feats[feat_name] = pad(raw_feats[feat_name], max_len, pad_idx=1,use_torch=use_torch)
-        if max_templates:
-            padded_feats[feat_name] = pad(padded_feats[feat_name], max_templates, pad_idx=0,use_torch=use_torch)
+                padded_feat = pad(padded_feat, max_len, pad_idx=1,use_torch=use_torch)
+
+            padded_feats[feat_name] = padded_feat
+    # UNPADDED_FEATS(NO TEMPLATE_FEATURES)
     for feat_name in UNPADDED_FEATS:
         if feat_name in raw_feats:
-            padded_feats[feat_name] = raw_feats[feat_name]
+            if feat_name not in TEMPLATE_FEATURES:
+                    padded_feats[feat_name] = raw_feats[feat_name]
     for feat_name in RIGID_FEATS:
         if feat_name in raw_feats:
-            # why rigid need to pad with identity?
+
             padded_feats[feat_name] = pad_rigid(raw_feats[feat_name], max_len)
 
     # pad from padded feature, mean it's a second pad for pair
@@ -341,7 +353,8 @@ def crop_feats(
         )
         templates_select_indices = templates_select_indices[templates_crop_start:templates_crop_start+num_templates_crop_size]
     else:
-        templates_select_indices = []
+        num_templates = min(num_templates,max_templates) if max_templates else num_templates
+        templates_select_indices = list(range(num_templates))
     n = seq_length - num_res_crop_size
     x = _randint(0, n)
     right_anchor = n - x
@@ -353,16 +366,22 @@ def crop_feats(
         for feat_name, feat in raw_feats.items()
         if feat_name not in UNPADDED_FEATS + TEMPLATE_FEATURES
     }
+    # TEMPLATE_FEATURES (PADDED and UNPADDED)
     for feat_name in TEMPLATE_FEATURES:
         if feat_name in raw_feats:
+            template_feat = raw_feats[feat_name]
             if subsample_templates:
-                cropped_feats[feat_name] = raw_feats[feat_name][templates_select_indices]
+                template_feat = template_feat[templates_select_indices]
             if feat_name not in UNPADDED_FEATS:
-                cropped_feats[feat_name] = crop(cropped_feats[feat_name], crop_len = num_res_crop_size, crop_start = num_res_crop_start,crop_idx = 1)
-    
+                template_feat = crop(template_feat, crop_len = num_res_crop_size, crop_start = num_res_crop_start,crop_idx = 1)
+            
+            cropped_feats[feat_name] = template_feat
+
+    # UNPADDED_FEATS(NO TEMPLATE_FEATURES)
     for feat_name in UNPADDED_FEATS:
-        if feat_name in raw_feats:
-            cropped_feats[feat_name] = raw_feats[feat_name]
+        if feat_name not in TEMPLATE_FEATURES:
+            if feat_name in raw_feats:
+                cropped_feats[feat_name] = raw_feats[feat_name]
 
     for feat_name in PAIR_FEATS:
         if feat_name in cropped_feats:
@@ -520,24 +539,30 @@ def length_batching(
     length_sorted = sorted(dicts_by_length, key=lambda x: x[0], reverse=True)
     max_len = length_sorted[0][0]
     max_batch_examples = int(max_squared_res // max_len**2)
-    pad_example = lambda x: pad_feats(x, max_len)
-    padded_batch = [
-        pad_example(x) for (_, x) in length_sorted[:max_batch_examples]]
-    return torch.utils.data.default_collate(padded_batch)
+    # pad_example = lambda x: pad_feats(x, max_len)
+    # padded_batch = [
+    #     pad_example(x) for (_, x) in length_sorted[:max_batch_examples]]
 
-def pad_and_crop(data_conf,raw_prots):
+    return torch.utils.data.default_collate(np_dicts[:max_batch_examples])
+
+def crop_and_pad(data_conf,raw_prots):
     processed_prots = []
-    fix_size = max([prot["aatype"].shape[0] for prot in raw_prots])
-
+    if data_conf.crop:
+        fix_size = min(max([prot["aatype"].shape[0] for prot in raw_prots]),data_conf.crop_size)
+    else:
+        fix_size = max([prot["aatype"].shape[0] for prot in raw_prots])
     for prot in raw_prots:
-        init_feats = tree.map_structure(lambda x: x if torch.is_tensor(x) else torch.tensor(x), prot)
+        processed_feats = tree.map_structure(lambda x: x if torch.is_tensor(x) else torch.tensor(x), prot)
         # print("init feature : ",{k:v.shape for k,v in init_feats.items()})
-        padded_feats = pad_feats(init_feats, fix_size,use_torch=True)
+        # padded_feats = pad_feats(init_feats, fix_size,use_torch=True)
         # print("after padding : ",{k:v.shape for k,v in padded_feats.items()})
-        if data_conf.crop:
-            cropped_feats = crop_feats(padded_feats, data_conf.crop_size,data_conf.max_templates,data_conf.subsample_templates)
+        processed_feats = crop_feats(processed_feats, 
+            crop_size =  data_conf.crop_size if data_conf.crop else fix_size,
+            max_templates = data_conf.max_templates,
+            subsample_templates = data_conf.subsample_templates)
+        processed_feats = pad_feats(processed_feats, fix_size,use_torch=True,max_templates=data_conf.max_templates)
         # print("after cropping : ",{k:v.shape for k,v in cropped_feats.items()})
-        processed_prots.append(cropped_feats)
+        processed_prots.append(processed_feats)
     return processed_prots
 
 
@@ -563,8 +588,15 @@ def create_data_loader(
             x, max_squared_res=max_squared_res)
     else:
         collate_fn = torch.utils.data.default_collate
-    _pad_and_crop = functools.partial(pad_and_crop,data_conf=data_conf)
-    collate_fn_final = lambda x : collate_fn(_pad_and_crop(raw_prots=x))
+
+    collate_fn_final = None
+
+    _crop_and_pad = functools.partial(crop_and_pad,data_conf=data_conf)
+    if torch_dataset.is_training:
+        collate_fn_final = lambda x : collate_fn(_crop_and_pad(raw_prots=x))
+    else:
+        # (feature,pdb_name) will be returned
+        collate_fn_final = lambda x : collate_fn([(i,j) for i,j in zip(_crop_and_pad(raw_prots=[prot[0] for prot in x]),[prot[1] for prot in x])])
     persistent_workers = True if num_workers > 0 else False
     prefetch_factor = 2 if num_workers == 0 else prefetch_factor
     return data.DataLoader(
@@ -768,7 +800,7 @@ def save_fasta(
             f.write(f'>{x}\n{y}\n')
 
 # set seed at main fucntion and each dataloader worker
-def seed_everything(seed: int = None) -> int:
+def seed_everything(seed = None) -> int:
 
     log = logging.getLogger(__name__)
 

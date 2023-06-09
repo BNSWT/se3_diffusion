@@ -84,7 +84,7 @@ def build_template_angle_feat(template_feats):
             torsion_angles_mask,
         ],
         dim=-1,
-    )
+    ).float()
 
     return template_angle_feat
 

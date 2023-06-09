@@ -5,44 +5,41 @@ defaults:
 
 data:
   # CSV for path and metadata to training examples.
-  csv_path: ./data/processed_pdb/metadata.csv
+  csv_path: data/processed_pdb/metadata.csv
   filtering:
-    max_len: 512
+    max_len: 448
     min_len: 60
     # Selects a subset of examples. Useful for debugging.
     subset: null
-    # monomer type
-    #   monomer
-    # complex type
-    #   dimer(2),dimer with peptides(?),trimer(3),tetramer(4),pentamer(5),
-    #   hexamer(6),heptamer(7),octamer(8),nonamer(9),decamer(10),undecamer(11),
-    #   dodecamer(12),tridecamer(13),tetradecamer(14),pentadecamer(15),hexadecamer(16),
-    #   heptadecamer(17),octadecamer(18),nonadecamer(19),eicosamer(20)'''
-    allowed_oligomer: [monomer]
-    max_helix_percent: 1.0
-    max_loop_percent: 0.5
-    min_beta_percent: -1.0
-    rog_quantile: 0.96
-  min_t: 0.01
-  num_t: 200
-  samples_per_eval_length: 4
-  num_eval_lengths: 10
   train:
-    # the delta t range between prev step and training step, the origin training setting can be viewed as delta_t_range = [1] in num_t = 100
     delta_t_range: [1, 2, 3, 4, 5]
     crop: False
-    crop_size: 512
-    # we only use template channel to embed self_condition feature
-    max_templates: null
+    crop_size: 256
+    max_template_hits: 4
+    # cant less than 1, otherwise padding of template feature will got error 
+    max_templates: 4
+    # subsample pick a random slice from sorted templates[slice_start : slice_start+max_templates]
+    subsample_templates: True
+    # shuffle topk perturb template order
+    shuffle_top_k_prefiltered : 20
+      
   eval:
+    csv_path: data/cameo/processed_pdb/metadata.csv
     crop: False
     crop_size: null
-    max_templates: null
-  # config used in strcture prediction/ , not available here
-  max_template_hits: 0
-  max_templates: 0
-  subsample_templates: False
-  shuffle_top_k_prefiltered : 0
+    max_template_hits: 4
+    max_templates: 4
+    # only best templates
+    subsample_templates: False
+    shuffle_top_k_prefiltered : null
+    filtering:
+      max_len: 800
+      min_len: 60
+      # Selects a subset of examples. Useful for debugging.
+      subset: 20
+    
+  min_t: 0.01
+  num_t: 200
 
 diffuser:
   diffuse_trans: True
@@ -76,7 +73,7 @@ model:
     node_embed_size: ${model.node_embed_size}
     edge_embed_size: ${model.edge_embed_size}
 
-    aatype_embed_size: False
+    aatype_embed_size: 21
     # embedding of relative position in pair
     rel_pos_emded_size: 32
     # embedding of absolute position in sequence
@@ -98,7 +95,7 @@ model:
       c_t: ${model.embed.template_embed_size}
       inf: 1e9
       eps: 1e-6
-      
+
       # control self condition embedding feature  
       self_condition:
         # now aatype process has two way: mask(mask all residue identity),atom_mask_match(match the final_atom_mask),
@@ -161,17 +158,19 @@ experiment:
 
   # Training arguments
   log_freq: 1000
-  batch_size: 128
-  eval_batch_size: ${data.samples_per_eval_length}
+  #batch size should be equal or greater to num_gpus
+  batch_size: 8
+  copy_num : 1
   num_loader_workers: 5
-  num_epoch: 20
+  num_epoch: 30
   learning_rate: 0.0001
   max_squared_res: 300000
   prefetch_factor: 100
   use_gpu: True
-  num_gpus: 2
+  num_gpus: 4
+
   # seed everything
-  seed : 123456
+  seed: 123456
 
   # Wandb logging
   wandb_dir: ./wandb_runs/
@@ -202,7 +201,8 @@ experiment:
 
   # Evaluation.
   eval_dir: ./eval_outputs
-  noise_scale: 1.0
+  # eval_dir: null
+  noise_scale: 0.01
   # Filled in during training.
   num_parameters: null
 
@@ -211,4 +211,4 @@ hydra:
     params:
       # Example of hydra multi run and wandb.
       experiment.name: use_wandb
-      experiment.use_wandb: True
+      experiment.use_wandb: False

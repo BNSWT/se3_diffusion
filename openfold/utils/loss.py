@@ -360,7 +360,7 @@ def supervised_chi_loss(
     loss = loss + angle_norm_weight * angle_norm_loss
 
     # Average over the batch dimension
-    loss = torch.mean(loss)
+    # loss = torch.mean(loss)
 
     return loss
 

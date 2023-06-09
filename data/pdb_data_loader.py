@@ -113,8 +113,10 @@ class PdbDataset(data.Dataset):
         pdb_csv = pd.read_csv(self.data_conf.csv_path)
         self.raw_csv = pdb_csv
         if filter_conf.allowed_oligomer is not None and len(filter_conf.allowed_oligomer) > 0:
-            pdb_csv = pdb_csv[pdb_csv.oligomeric_details.isin(
-                filter_conf.allowed_oligomer)]
+            filter_conf.allowed_oligomer= [oligomer.strip() for oligomer in filter_conf.allowed_oligomer]
+            filter_conf.allowed_oligomer.extend([f'{oligomer}ic' for oligomer in filter_conf.allowed_oligomer])
+            self._log.info(f'Filtering oligomers: {filter_conf.allowed_oligomer}')
+            pdb_csv = pdb_csv[pdb_csv.oligomeric_details.str.lower().isin(filter_conf.allowed_oligomer)]
         if filter_conf.max_len is not None:
             pdb_csv = pdb_csv[pdb_csv.modeled_seq_len <= filter_conf.max_len]
         if filter_conf.min_len is not None:
@@ -180,10 +182,14 @@ class PdbDataset(data.Dataset):
             'all_atom_positions': torch.tensor(processed_feats['atom_positions']).double(),
             'all_atom_mask': torch.tensor(processed_feats['atom_mask']).double()
         }
-        assemble_feats = data_transforms.atom37_to_frames(assemble_feats)
-        assemble_feats = data_transforms.make_atom14_masks(assemble_feats)
-        assemble_feats = data_transforms.make_atom14_positions(assemble_feats)
-        assemble_feats = data_transforms.atom37_to_torsion_angles()(assemble_feats)
+        data_transforms.atom37_to_frames(assemble_feats)
+        data_transforms.make_atom14_masks(assemble_feats)
+        data_transforms.make_atom14_positions(assemble_feats)
+        data_transforms.atom37_to_torsion_angles()(assemble_feats)
+        data_transforms.atom37_to_torsion_angles("")(assemble_feats),
+        data_transforms.make_pseudo_beta("")(assemble_feats),
+        data_transforms.get_backbone_frames(assemble_feats),
+        data_transforms.get_chi_angles(assemble_feats),
 
         # Re-number residue indices for each chain such that it starts from 1.
         # Randomize chain indices.
@@ -208,14 +214,31 @@ class PdbDataset(data.Dataset):
             'aatype': assemble_feats['aatype'],
             'seq_idx': new_res_idx,
             'chain_idx': new_chain_idx,
+            'residx_atom37_to_atom14': assemble_feats['residx_atom37_to_atom14'],
             'residx_atom14_to_atom37': assemble_feats['residx_atom14_to_atom37'],
             'residue_index': processed_feats['residue_index'],
             'res_mask': processed_feats['bb_mask'],
             'atom37_pos': assemble_feats['all_atom_positions'],
             'atom37_mask': assemble_feats['all_atom_mask'],
+            "atom37_atom_exists": assemble_feats["atom37_atom_exists"],
             'atom14_pos': assemble_feats['atom14_gt_positions'],
             'rigidgroups_0': assemble_feats['rigidgroups_gt_frames'],
             'torsion_angles_sin_cos': assemble_feats['torsion_angles_sin_cos'],
+            # fape loss feture
+            "backbone_rigid_mask": assemble_feats["backbone_rigid_mask"],
+            "backbone_rigid_tensor": assemble_feats["backbone_rigid_tensor"],
+            'rigidgroups_0': assemble_feats['rigidgroups_gt_frames'],
+            'rigidgroups_gt_exists' : assemble_feats['rigidgroups_gt_exists'],
+            "rigidgroups_gt_frames" : assemble_feats['rigidgroups_gt_frames'],
+            'rigidgroups_alt_gt_frames' : assemble_feats['rigidgroups_alt_gt_frames'],
+            # side chain feature
+            # used in compute_renamed_ground_truth for ambigous prediction
+            "atom14_gt_exists": assemble_feats["atom14_gt_exists"],
+            "atom14_gt_positions": assemble_feats["atom14_gt_positions"],
+            "atom14_alt_gt_exists": assemble_feats["atom14_alt_gt_exists"],
+            "atom14_alt_gt_positions": assemble_feats["atom14_alt_gt_positions"],
+            "atom14_atom_exists": assemble_feats["atom14_atom_exists"],
+            "atom14_atom_is_ambiguous": assemble_feats["atom14_atom_is_ambiguous"],
         }
         return final_feats
 
@@ -278,16 +301,51 @@ class PdbDataset(data.Dataset):
         fixed_mask = 1 - diffused_mask
         assemble_feats['fixed_mask'] = fixed_mask
         assemble_feats['rigids_0'] = gt_bb_rigid.to_tensor_7()
-        assemble_feats['sc_ca_t'] = torch.zeros_like(gt_bb_rigid.get_trans())
-
+        diff_feats_t = {}
         # Sample t and diffuse.
         if self.is_training:
+            # prev step feature for self-condition 
             t = rng.uniform(self._data_conf.min_t, 1.0)
-            diff_feats_t = self._diffuser.forward_marginal(
+            diff_feats_t_prev = self._diffuser.forward_marginal(
                 rigids_0=gt_bb_rigid,
                 t=t,
                 diffuse_mask=None
             )
+            diff_feats_t_prev['t'] = t
+            # training step feature
+            dt = (1.0-self._data_conf.min_t)/self._data_conf.num_t
+            dt = [min(t-self._data_conf.min_t,dt*i) for i in self._data_conf.delta_t_range][rng.integers(len(self._data_conf.delta_t_range))]
+            rigids_t = self._diffuser.reverse(
+                rigid_t=rigid_utils.Rigid.from_tensor_7(diff_feats_t_prev['rigids_t']),
+                rot_score=du.move_to_np(diff_feats_t_prev["rot_score"]),
+                trans_score=du.move_to_np(diff_feats_t_prev["trans_score"]),
+                diffuse_mask=None,
+                t=t,
+                dt=dt,
+                center=True,
+                noise_scale=0.0,
+            )
+            rot_score = self._diffuser.calc_rot_score(
+                rigids_t.get_rots()[None,...],
+                gt_bb_rigid.get_rots()[None,...],
+                t = torch.Tensor([t-dt])
+            )[0]
+            trans_score = self._diffuser.calc_trans_score(
+                rigids_t.get_trans()[None,...],
+                gt_bb_rigid.get_trans()[None,...],
+                t = torch.Tensor([t-dt]),
+            )[0]
+            rot_score_scaling,trans_score_scaling = self._diffuser.score_scaling(t-dt)
+            diff_feats_t = {
+                'rigids_t': rigids_t.to_tensor_7(),
+                'trans_score': trans_score,
+                'rot_score': rot_score,
+                'trans_score_scaling': trans_score_scaling,
+                'rot_score_scaling': rot_score_scaling,
+                'fixed_mask': fixed_mask,
+                **{"self_condition_"+k:v for k,v in diff_feats_t_prev.items()}
+            }
+            diff_feats_t['t'] = t-dt
         else:
             t = 1.0
             diff_feats_t = self.diffuser.sample_ref(
@@ -296,8 +354,8 @@ class PdbDataset(data.Dataset):
                 diffuse_mask=None,
                 as_tensor_7=True,
             )
+            diff_feats_t['t'] = t
         assemble_feats.update(diff_feats_t)
-        assemble_feats['t'] = t
 
         # Convert all features to tensors.
         final_feats = tree.map_structure(
@@ -409,7 +467,7 @@ class DistributedTrainSampler(data.Sampler):
                 dataset,
                 batch_size,
                 num_replicas: Optional[int] = None,
-                rank: Optional[int] = None, shuffle: bool = True,
+                rank: Optional[int] = None, shuffle: bool = True,order: bool = False,
                 seed: int = 0, drop_last: bool = False,copy_num : int = None) -> None:
         if num_replicas is None:
             if not dist.is_available():
@@ -449,6 +507,7 @@ class DistributedTrainSampler(data.Sampler):
             self.num_samples = math.ceil(self._repeated_size / self.num_replicas)  # type: ignore[arg-type]
         self.total_size = self.num_samples * self.num_replicas
         self.shuffle = shuffle
+        self.order = order
         self.seed = seed if seed is not None else 0
 
     def __iter__(self) :
@@ -478,6 +537,10 @@ class DistributedTrainSampler(data.Sampler):
 
         # subsample
         indices = indices[self.rank:self.total_size:self.num_replicas]
+        # sort indices, speed up for length-sorted index
+        if self.order:
+            indices = sorted(indices)
+
         # 
         assert len(indices) == self.num_samples
 

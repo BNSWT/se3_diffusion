@@ -80,7 +80,19 @@ parser.add_argument(
     '--verbose',
     help='Whether to log everything.',
     action='store_true')
-
+parser.add_argument(
+    '--mode',
+    help='Whether to overwrite processed pickel.',
+    choices=["overwrite","update"])
+# some option for sequence and structure clusters
+parser.add_argument(
+    '--dump_chain_pdb',
+    help='whther dump each protein chain in pdb format',
+    action='store_true')
+parser.add_argument(
+    '--dump_chain_fasta',
+    help='whther dump each protein chain in pdb format',
+    action='store_true')
 def score_sequence(seq_i,seq_j):
     alignments = pairwise2.align.globalxx(seq_i, seq_j)
     
@@ -159,8 +171,8 @@ def _retrieve_mmcif_files(
                 continue
             mmcif_path = os.path.join(mmcif_file_dir, mmcif_file)
             total_num_files += 1
-            if min_file_size <= os.path.getsize(mmcif_path) <= max_file_size:
-                all_mmcif_paths.append(mmcif_path)
+            # if min_file_size <= os.path.getsize(mmcif_path) <= max_file_size:
+            all_mmcif_paths.append(mmcif_path)
         if debug and total_num_files >= 10:
             all_mmcif_paths = all_mmcif_paths[:10]
             break
@@ -240,41 +252,44 @@ def process_mmcif(
 
     ##### assemble filter for all unique assembles and their chains #####
     if '_pdbx_struct_assembly.oligomeric_count' in raw_mmcif:
-        assembly_property = mmcif_parsing.get_assembly_mapping(raw_mmcif)
-        keep_chains,keep_assembles = assembly_filter(struct_chains,assembly_property)
-        # only keep protein chains
-        keep_chains = [chain_id for chain_id in keep_chains if chain_id in struct_chains]
-        for assemble_id in keep_assembles:
-            protein_chains = [chain_id for chain_id in  assembly_property[assemble_id]['asym_id_list'] if chain_id in keep_chains]
-            assemble_metadatas.append({
-                'assemble_id' : assemble_id,
-                'details' : assembly_property[assemble_id]['details'],
-                'oligomeric_details': assembly_property[assemble_id]['oligomeric_details'],
-                'oligomeric_count': assembly_property[assemble_id]['oligomeric_count'],
-                'oper_expression': assembly_property[assemble_id]['oper_expression'],
-                'asym_id_list': protein_chains,
-            })
-        # Return when there is no proper assemble by reasons below:
-        # 1. those assembles need oper_expression not support now
-        if not keep_assembles:
-            return None
-    # except Exception as e:
-    #     raise errors.MmcifParsingError(f"Error occured during parsing assembles of {mmcif_path} \n{e}")
+        try:
+            assembly_property = mmcif_parsing.get_assembly_mapping(raw_mmcif)
+            keep_chains,keep_assembles = assembly_filter(struct_chains,assembly_property)
+            # only keep protein chains
+            keep_chains = [chain_id for chain_id in keep_chains if chain_id in struct_chains]
+            for assemble_id in keep_assembles:
+                protein_chains = [chain_id for chain_id in  assembly_property[assemble_id]['asym_id_list'] if chain_id in keep_chains]
+                assemble_metadatas.append({
+                    'assemble_id' : assemble_id,
+                    'details' : assembly_property[assemble_id]['details'],
+                    'oligomeric_details': assembly_property[assemble_id]['oligomeric_details'],
+                    'oligomeric_count': assembly_property[assemble_id]['oligomeric_count'],
+                    'oper_expression': assembly_property[assemble_id]['oper_expression'],
+                    'asym_id_list': protein_chains,
+                })
+            # Return when there is no proper assemble by reasons below:
+            # 1. those assembles need oper_expression not support now
+            if not keep_assembles:
+                return None
+        except Exception as e:
+            raise errors.DataError(f"Error occured during parsing assembles of {mmcif_path} \n")
+    else:
+        []
+
     # Extract features
     chains_dict = {}
-
+    chains_sequence = {}
     for chain_id, chain in struct_chains.items():
-
-        # direct use char chain id
-        chain_prot = parsers.process_chain(chain, chain_id)
-        chain_dict = dataclasses.asdict(chain_prot)
-
-        ##################### chain filter ###############
-        if keep_chains and chain_id not in keep_chains:
-            continue
-        ##################### chain filter ###############
-
         try:
+            # direct use char chain id
+            chain_prot = parsers.process_chain(chain, chain_id)
+            chain_dict = dataclasses.asdict(chain_prot)
+
+            ##################### chain filter ###############
+            if keep_chains and chain_id not in keep_chains:
+                continue
+            ##################### chain filter ###############
+
             # cut out unknown residues of both side
             modeled_idx = np.where(chain_dict["aatype"] != 20)[0]
             min_idx = np.min(modeled_idx)
@@ -283,20 +298,24 @@ def process_mmcif(
                 lambda x: x[min_idx:(max_idx+1)], chain_dict)
             chain_length = chain_dict['aatype'].shape[0]
             chain_dict["residue_index"] = np.arange(0,chain_length)
-
+            chains_sequence[chain_id] = "".join([ residue_constants.restype_3to1.get(res.resname, 'X') for res in chain ])[min_idx:(max_idx+1)]
             chains_dict[chain_id] = chain_dict
         except Exception as e:
-            logging.warning(errors.DataError(f"Error occured during process {mmcif_path} chain {chain_id}\n{e}"))
+            logging.warning(errors.DataError(f"Error occured during process {mmcif_path} chain {chain_id}"))
 
 
     if not chains_dict:
         raise errors.DataError(f"No protein chains found in {mmcif_path}")
-
+    
+    dumped_chains = []
     for assemble_data in assemble_metadatas:
         try:
             assemble_data["asym_id_list"] = [chain_id for chain_id in assemble_data["asym_id_list"] if chain_id in chains_dict]
+            
             if not assemble_data["asym_id_list"]:
-                raise ValueError(f"no chains exists in assemble {assemble_data['assemble_id']}")
+                logging.info(errors.DataError(f"no protein chains exists in assemble {assemble_data['assemble_id']}"))
+                continue
+            
             assemble_chains_dict = [chains_dict[chain_id] for chain_id in assemble_data["asym_id_list"]]
             assemble_feat_dict = du.concat_np_features(assemble_chains_dict, False)
             # trasform to pdb
@@ -327,14 +346,28 @@ def process_mmcif(
                 'radius_gyration' : pdb_dg[0],
 
             })
-        except Exception as e:
-            logging.warning(errors.DataError(f"Error occured during process {mmcif_path} assemble {assemble_data['assemble_id']}\n{e.with_traceback(None)}"))
+            # dump pdb and fasta
+            for chain_id in assemble_data["asym_id_list"]:
+                if args.dump_chain_fasta and chain_id in chains_sequence and chain_id not in dumped_chains:
+                    fasta_path = os.path.join(mmcif_subdir, f'{mmcif_name}_{chain_id}.fasta')
+                    if not os.path.exists(fasta_path):
+                        open(fasta_path,"w").write(f">{mmcif_name}_{chain_id}\n{chains_sequence[chain_id]}")
+                if args.dump_chain_pdb and chain_id in chains_dict and chain_id not in dumped_chains:
+                    pdb_path = os.path.join(mmcif_subdir, f'{mmcif_name}_{chain_id}.pdb')
+                    chain_protein = Protein(**chains_dict[chain_id])
+                    pdb_string = to_pdb(chain_protein)
+                    if not os.path.exists(pdb_path):
+                        open(pdb_path,"w").write(pdb_string)
+                dumped_chains.append(chain_id)
+        except Exception:
+            logging.warning(errors.DataError(f"Error occured during process {mmcif_path} assemble {assemble_data['assemble_id']}\n"))
     if not metadatas:
         raise errors.DataError(f"No assemble found in {mmcif_path}")
     if verbose:
         logging.info(metadatas)
     # Write features to pickles.
-    du.write_pkl(processed_mmcif_path, chains_dict)
+    if not os.path.exists(processed_mmcif_path) or args.mode=='overwrite':
+        du.write_pkl(processed_mmcif_path, chains_dict)
 
     # Return metadata
     return metadatas
@@ -344,15 +377,18 @@ def process_serially(
         all_mmcif_paths, max_resolution, write_dir):
     all_metadata = []
     for i, mmcif_path in enumerate(all_mmcif_paths):
-        start_time = time.time()
-        metadata = process_mmcif(
-            mmcif_path,
-            max_resolution,
-            write_dir,
-            verbose = True)
-        elapsed_time = time.time() - start_time
-        logging.info(f'Finished {mmcif_path} in {elapsed_time:2.2f}s')
-        all_metadata.append(metadata)
+        try:
+            start_time = time.time()
+            metadata = process_mmcif(
+                mmcif_path,
+                max_resolution,
+                write_dir,
+                verbose = True)
+            elapsed_time = time.time() - start_time
+            logging.info(f'Finished {mmcif_path} in {elapsed_time:2.2f}s')
+            all_metadata.append(metadata)
+        except Exception as e:
+            logging.exception(f'Failed {mmcif_path}: {e}')
     return all_metadata
 
 
@@ -371,8 +407,10 @@ def process_fn(
         elapsed_time = time.time() - start_time
         logging.info(f'Finished {mmcif_path} in {elapsed_time:2.2f}s')
         return metadata
-    except errors.DataError as e:
-        logging.info(f'Failed {mmcif_path}: {e}')
+    except Exception as e:
+        # exception will print full traceback
+        logging.warning(f'Failed {mmcif_path}: {e}')
+        return None
 
 
 def main(args):
@@ -416,7 +454,12 @@ def main(args):
     flattened_metadata = flatten_list(all_metadata)
 
     metadata_df = pd.DataFrame(flattened_metadata)
-    metadata_df.to_csv(metadata_path, index=False)
+    if not os.path.exists(metadata_path) or args.mode=='overwrite':
+        metadata_df.to_csv(metadata_path, index=False)
+    elif args.mode=='update':
+        if os.path.exists(metadata_path):
+            old_metadata_df = pd.read_csv(metadata_path)
+            metadata_df = pd.concat([old_metadata_df,metadata_df],ignore_index=True)
 
 
 if __name__ == "__main__":

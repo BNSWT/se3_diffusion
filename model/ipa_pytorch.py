@@ -495,7 +495,9 @@ class TorsionAngles(nn.Module):
         s = self.linear_2(s)
 
         s = s + s_initial
-        unnormalized_s = self.linear_final(s)
+        s = self.linear_final(s)
+        s = s.view(s.shape[:-1] + (-1, 2))
+        unnormalized_s = s
         norm_denom = torch.sqrt(
             torch.clamp(
                 torch.sum(unnormalized_s ** 2, dim=-1, keepdim=True),
@@ -605,68 +607,76 @@ class IpaScore(nn.Module):
                     edge_embed_in=edge_in,
                     edge_embed_out=self._model_conf.edge_embed_size,
                 )
+        # TODO this easy single layer resnet is much maller than angle resnet in AF2
+        self.torsion_pred = TorsionAngles(ipa_conf.c_s, 7 if ipa_conf.sidechain else 1)
 
-        self.torsion_pred = TorsionAngles(ipa_conf.c_s, 1)
 
     def forward(self, init_node_embed, edge_embed, input_feats):
-        node_mask = input_feats['res_mask'].type(torch.float32)
-        diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
-        edge_mask = node_mask[..., None] * node_mask[..., None, :]
-        init_frames = input_feats['rigids_t'].type(torch.float32)
+        with torch.autograd.profiler.record_function("ipa_score"):
+            node_mask = input_feats['res_mask'].type(torch.float32)
+            diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
+            edge_mask = node_mask[..., None] * node_mask[..., None, :]
+            init_frames = input_feats['rigids_t'].type(torch.float32)
 
-        curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
-        init_rigids = Rigid.from_tensor_7(init_frames)
-        init_rots = init_rigids.get_rots()
+            curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
+            init_rigids = Rigid.from_tensor_7(init_frames)
+            init_rots = init_rigids.get_rots()
 
-        # Main trunk
-        curr_rigids = self.scale_rigids(curr_rigids)
-        init_node_embed = init_node_embed * node_mask[..., None]
-        node_embed = init_node_embed * node_mask[..., None]
-        for b in range(self._ipa_conf.num_blocks):
-            ipa_embed = self.trunk[f'ipa_{b}'](
-                node_embed,
-                edge_embed,
-                curr_rigids,
-                node_mask)
-            ipa_embed *= node_mask[..., None]
-            node_embed = self.trunk[f'ipa_ln_{b}'](node_embed + ipa_embed)
-            seq_tfmr_in = torch.cat([
-                node_embed, self.trunk[f'skip_embed_{b}'](init_node_embed)
-            ], dim=-1)
-            seq_tfmr_out = self.trunk[f'seq_tfmr_{b}'](
-                seq_tfmr_in, src_key_padding_mask=1 - node_mask)
-            node_embed = node_embed + self.trunk[f'post_tfmr_{b}'](seq_tfmr_out)
-            node_embed = self.trunk[f'node_transition_{b}'](node_embed)
-            node_embed = node_embed * node_mask[..., None]
-            rigid_update = self.trunk[f'bb_update_{b}'](
-                node_embed * diffuse_mask[..., None])
-            curr_rigids = curr_rigids.compose_q_update_vec(
-                rigid_update, diffuse_mask[..., None])
+            # Main trunk
+            curr_rigids = self.scale_rigids(curr_rigids)
+            init_node_embed = init_node_embed * node_mask[..., None]
+            node_embed = init_node_embed * node_mask[..., None]
+            for b in range(self._ipa_conf.num_blocks):
+                ipa_embed = self.trunk[f'ipa_{b}'](
+                    node_embed,
+                    edge_embed,
+                    curr_rigids,
+                    node_mask)
+                ipa_embed *= node_mask[..., None]
+                node_embed = self.trunk[f'ipa_ln_{b}'](node_embed + ipa_embed)
+                seq_tfmr_in = torch.cat([
+                    node_embed, self.trunk[f'skip_embed_{b}'](init_node_embed)
+                ], dim=-1)
+                seq_tfmr_out = self.trunk[f'seq_tfmr_{b}'](
+                    seq_tfmr_in, src_key_padding_mask=1 - node_mask)
+                node_embed = node_embed + self.trunk[f'post_tfmr_{b}'](seq_tfmr_out)
+                node_embed = self.trunk[f'node_transition_{b}'](node_embed)
+                node_embed = node_embed * node_mask[..., None]
+                rigid_update = self.trunk[f'bb_update_{b}'](
+                    node_embed * diffuse_mask[..., None])
+                curr_rigids = curr_rigids.compose_q_update_vec(
+                    rigid_update, diffuse_mask[..., None])
 
-            if b < self._ipa_conf.num_blocks-1:
-                edge_embed = self.trunk[f'edge_transition_{b}'](
-                    node_embed, edge_embed)
-                edge_embed *= edge_mask[..., None]
-        rot_score = self.diffuser.calc_rot_score(
-            init_rigids.get_rots(),
-            curr_rigids.get_rots(),
-            input_feats['t']
-        )
-        rot_score = rot_score * node_mask[..., None]
+                if b < self._ipa_conf.num_blocks-1:
+                    edge_embed = self.trunk[f'edge_transition_{b}'](
+                        node_embed, edge_embed)
+                    edge_embed *= edge_mask[..., None]
+            rot_score = self.diffuser.calc_rot_score(
+                init_rigids.get_rots(),
+                curr_rigids.get_rots(),
+                input_feats['t']
+            )
+            rot_score = rot_score * node_mask[..., None]
 
-        curr_rigids = self.unscale_rigids(curr_rigids)
-        trans_score = self.diffuser.calc_trans_score(
-            init_rigids.get_trans(),
-            curr_rigids.get_trans(),
-            input_feats['t'][:, None, None],
-            use_torch=True,
-        )
-        trans_score = trans_score * node_mask[..., None]
-        _, psi_pred = self.torsion_pred(node_embed)
-        model_out = {
-            'psi': psi_pred,
-            'rot_score': rot_score,
-            'trans_score': trans_score,
-            'final_rigids': curr_rigids,
-        }
-        return model_out
+            curr_rigids = self.unscale_rigids(curr_rigids)
+            trans_score = self.diffuser.calc_trans_score(
+                init_rigids.get_trans(),
+                curr_rigids.get_trans(),
+                input_feats['t'][:, None, None],
+                use_torch=True,
+            )
+            trans_score = trans_score * node_mask[..., None]
+            unnormalized_angles, angles = self.torsion_pred(node_embed)
+            model_out = {
+                'psi': angles[...,0,:] if not self._ipa_conf.sidechain else angles[...,2,:],
+                "unnormalized_angles": unnormalized_angles,
+                "angles": angles,
+                'rot_score': rot_score,
+                'trans_score': trans_score,
+                # only backbone rigid [B,N,7]
+                'final_rigids': curr_rigids,
+                # latent embedding
+                'node_embed': node_embed.detach(),
+                'edge_embed': edge_embed.detach(),
+            }
+            return model_out

@@ -1,18 +1,6 @@
-"""Pytorch script for training SE(3) protein diffusion.
-
-To run:
-
-> python experiments/train_se3_diffusion.py
-
-Without Wandb,
-
-> python experiments/train_se3_diffusion.py experiment.use_wandb=False
-
-To modify config options with the command line,
-
-> python experiments/train_se3_diffusion.py experiment.batch_size=32
-
-"""
+import hydra
+from omegaconf import DictConfig
+import os
 import os
 import torch
 import GPUtil
@@ -25,7 +13,6 @@ import logging
 import copy
 import random
 import pandas as pd
-
 from collections import defaultdict
 from collections import deque
 from datetime import datetime
@@ -35,6 +22,12 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from openfold.utils import rigid_utils as ru
+from openfold.utils.loss import (
+    compute_renamed_ground_truth,
+    compute_fape,
+    supervised_chi_loss,
+    lddt_ca
+)
 from hydra.core.hydra_config import HydraConfig
 
 from analysis import utils as au
@@ -46,10 +39,10 @@ from data import all_atom
 from model import score_network
 from experiments import utils as eu
 
-from openfold.utils.loss import compute_fape
+from structure_prediction.data.pdb_data_loader import PDBDataset
 
 class Experiment:
-
+    
     def __init__(
             self,
             *,
@@ -64,11 +57,10 @@ class Experiment:
         self._available_gpus = ''.join(
             [str(x) for x in GPUtil.getAvailable(
                 order='memory', limit = 8)])
-
+        # 
         # Configs
         self._conf = conf
         self._exp_conf = conf.experiment
-        print(conf.experiment)
         if HydraConfig.initialized() and 'num' in HydraConfig.get().job:
             self._exp_conf.name = (
                 f'{self._exp_conf.name}_{HydraConfig.get().job.num}')
@@ -80,15 +72,12 @@ class Experiment:
         self._conf.experiment.seed = du.seed_everything(self._conf.experiment.seed)
         self._generator = np.random.default_rng(self._conf.experiment.seed)
 
-        # 1. initialize ddp info if in ddp mode
-        # 2. silent rest of logger when use ddp mode
-        # 3. silent wandb logger
-        # 4. unset checkpoint path if rank is not 0 to avoid saving checkpoints and evaluation
         if self._use_ddp :
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
             dist.init_process_group(backend='nccl')
             self.ddp_info = eu.get_ddp_info()
             if self.ddp_info['rank'] not in [0,-1]:
-                self._log.setLevel(logging.ERROR)
+                self._log.setLevel("ERROR")
                 self._use_wandb = False
                 self._exp_conf.ckpt_dir = None
         # Warm starting
@@ -125,11 +114,9 @@ class Experiment:
             if 'step' in ckpt_pkl:
                 self.trained_steps = ckpt_pkl['step']
 
-
         # Initialize experiment objects
         self._diffuser = se3_diffuser.SE3Diffuser(self._diff_conf)
-        self._model = score_network.ScoreNetwork(
-            self._model_conf, self.diffuser)
+        self._model = score_network.ScoreNetwork(self._model_conf, self._diffuser)
 
         if ckpt_model is not None:
             ckpt_model = {k.replace('module.', ''):v for k,v in ckpt_model.items()}
@@ -147,10 +134,11 @@ class Experiment:
             # Set-up checkpoint location
             ckpt_dir = os.path.join(
                 self._exp_conf.ckpt_dir,
-                self._exp_conf.name)
+                self._exp_conf.name,
+                )
+            self._exp_conf.ckpt_dir = ckpt_dir
             if not os.path.exists(ckpt_dir):
                 os.makedirs(ckpt_dir, exist_ok=True)
-            self._exp_conf.ckpt_dir = ckpt_dir
             OmegaConf.save(conf, os.path.join(ckpt_dir, 'config.yaml'))
             self._log.info(f'Checkpoints saved to: {ckpt_dir}')
         else:  
@@ -158,13 +146,14 @@ class Experiment:
         if self._exp_conf.eval_dir is not None :
             eval_dir = os.path.join(
                 self._exp_conf.eval_dir,
-                self._exp_conf.name)
-            os.makedirs(eval_dir, exist_ok=True)
+                self._exp_conf.name,
+                )
             self._exp_conf.eval_dir = eval_dir
+            if not os.path.exists(eval_dir):
+                os.makedirs(eval_dir, exist_ok=True)
             OmegaConf.save(conf, os.path.join(eval_dir, 'config.yaml'))
             self._log.info(f'Evaluation saved to: {eval_dir}')
         else:
-            self._exp_conf.eval_dir = os.devnull
             self._log.info(f'Evaluation will not be saved.')
         self._aux_data_history = deque(maxlen=100)
 
@@ -181,62 +170,65 @@ class Experiment:
         return self._conf
 
     def create_dataset(self):
+        
+        # TODO valid dataset is not implemnted
+
         conf_train = DictConfig(self._data_conf)
         conf_train.update(self._data_conf.train)
         conf_eval = DictConfig(self._data_conf)
         conf_eval.update(self._data_conf.eval)
         # Datasets
-        train_dataset = pdb_data_loader.PdbDataset(
+        train_dataset = PDBDataset(
             data_conf=conf_train,
             diffuser=self._diffuser,
             is_training=True
         )
-
-        valid_dataset = pdb_data_loader.PdbDataset(
-            data_conf=conf_eval,
-            diffuser=self._diffuser,
-            is_training=False
+        train_sampler = pdb_data_loader.DistributedTrainSampler(
+            data_conf=conf_train,
+            dataset=train_dataset,
+            batch_size=self._exp_conf.batch_size,
+            copy_num= self._exp_conf.copy_num,
+            num_replicas=self.ddp_info["world_size"] if self._use_ddp else 1,
+            rank= self.ddp_info["rank"] if self._use_ddp else 0,
+            seed = self._conf.experiment.seed,
+            shuffle=True,
+            # only do limited shuffle for multi gpu training
+            order=True
         )
-        if not self._use_ddp:
-            train_sampler = pdb_data_loader.TrainSampler(
-                data_conf=conf_train,
-                dataset=train_dataset,
-                batch_size=self._exp_conf.batch_size,
-            )
-        else:
-            train_sampler = pdb_data_loader.DistributedTrainSampler(
-                data_conf=conf_train,
-                dataset=train_dataset,
-                batch_size=self._exp_conf.batch_size,
-            )
-        valid_sampler = None
 
-        # Loaders
-        num_workers = self._exp_conf.num_loader_workers
-        print(conf_train)
         train_loader = du.create_data_loader(
             train_dataset,
             data_conf=conf_train,
             sampler=train_sampler,
             np_collate=False,
-            length_batch=True,
+            length_batch=False,
             batch_size=self._exp_conf.batch_size if not self._exp_conf.use_ddp else self._exp_conf.batch_size // self.ddp_info['world_size'],
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=self._exp_conf.num_loader_workers,
             drop_last=False,
             max_squared_res=self._exp_conf.max_squared_res,
         )
-        valid_loader = du.create_data_loader(
-            valid_dataset,
-            data_conf=conf_eval,
-            sampler=valid_sampler,
-            np_collate=False,
-            length_batch=False,
-            batch_size=self._exp_conf.eval_batch_size,
-            shuffle=False,
-            num_workers=0,
-            drop_last=False,
-        )
+        valid_dataset = None
+        valid_loader = None
+        valid_sampler = None
+        if self.ddp_info['rank'] == 0 and self._exp_conf.eval_dir is not None and self._data_conf.eval.csv_path is not None:
+            valid_dataset = PDBDataset(
+                data_conf=conf_eval,
+                diffuser=self._diffuser,
+                is_training=False
+            )
+            valid_loader = du.create_data_loader(
+                valid_dataset,
+                data_conf=conf_eval,
+                sampler=None,
+                np_collate=False,
+                length_batch=False,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                drop_last=False,
+            )
+
         return train_loader, valid_loader, train_sampler, valid_sampler
 
     def init_wandb(self):
@@ -244,7 +236,7 @@ class Experiment:
         conf_dict = OmegaConf.to_container(self._conf, resolve=True)
         os.makedirs(os.path.join(self._exp_conf.wandb_dir,self._exp_conf.name), exist_ok=True)
         wandb.init(
-            project='se3-diffusion',
+            project='se3-diffusion-strucutre-prediction',
             name=self._exp_conf.name,
             config=dict(eu.flatten_dict(conf_dict)),
             dir=os.path.join(self._exp_conf.wandb_dir,self._exp_conf.name),
@@ -253,7 +245,7 @@ class Experiment:
         self._exp_conf.wandb_dir = wandb.run.dir
         self._log.info(
             f'Wandb: run_id={self._exp_conf.run_id}, run_dir={self._exp_conf.wandb_dir}')
-
+        
     def start_training(self, return_logs=False):
         # Set environment variables for which GPUs to use.
         if HydraConfig.initialized() and 'num' in HydraConfig.get().job:
@@ -261,7 +253,8 @@ class Experiment:
         else:
             replica_id = 0
         if self._use_wandb and replica_id == 0:
-                self.init_wandb()
+            self.init_wandb()
+
         assert(not self._exp_conf.use_ddp or self._exp_conf.use_gpu)
 
         # GPU mode
@@ -324,7 +317,7 @@ class Experiment:
 
         self._log.info('Done')
         return logs
-
+    
     def update_fn(self, data):
         """Updates the state using some data and returns metrics."""
         self._optimizer.zero_grad()
@@ -338,17 +331,23 @@ class Experiment:
         log_lossses = defaultdict(list)
         global_logs = []
         log_time = time.time()
-        step_time = time.time()
+        
         for train_feats in train_loader:
+            ckpt_metrics = None
+            eval_time = None
+            step_time = time.time()
             train_feats = tree.map_structure(
                 lambda x: x.to(device), train_feats)
+            
             loss, aux_data = self.update_fn(train_feats)
             if return_logs:
                 global_logs.append(loss)
             for k,v in aux_data.items():
                 log_lossses[k].append(du.move_to_np(v))
             self.trained_steps += 1
-
+            step_time = time.time() - step_time
+            # print(f"batch_size :{train_feats['aatype'].shape[0]}, res length :{train_feats['aatype'].shape[1]}, template size {train_feats['template_aatype'].shape[1]}, {step_time:.2f}")
+            example_per_sec = self._exp_conf.batch_size / step_time
             # Logging to terminal
             if self.trained_steps == 1 or self.trained_steps % self._exp_conf.log_freq == 0:
                 elapsed_time = time.time() - log_time
@@ -364,44 +363,37 @@ class Experiment:
                 log_lossses = defaultdict(list)
 
             # Take checkpoint
-            if self._exp_conf.ckpt_dir is not None and (
-                    (self.trained_steps % self._exp_conf.ckpt_freq) == 0
-                    or (self._exp_conf.early_ckpt and self.trained_steps == 100)
-                ):
-                ckpt_path = os.path.join(
-                    self._exp_conf.ckpt_dir, f'step_{self.trained_steps}.pth')
-                du.write_checkpoint(
-                    ckpt_path,
-                    self.model.state_dict(),
-                    self._conf,
-                    self._optimizer.state_dict(),
-                    self.trained_epochs,
-                    self.trained_steps,
-                    logger=self._log,
-                    use_torch=True
-                )
+            if (self.trained_steps % self._exp_conf.ckpt_freq) == 0 or (self._exp_conf.early_ckpt and self.trained_steps == 100):
+                if self._exp_conf.ckpt_dir is not None :
+                    ckpt_path = os.path.join(
+                        self._exp_conf.ckpt_dir, f'step_{self.trained_steps}.pth')
+                    du.write_checkpoint(
+                        ckpt_path,
+                        self.model.state_dict(),
+                        self._conf,
+                        self._optimizer.state_dict(),
+                        self.trained_epochs,
+                        self.trained_steps,
+                        logger=self._log,
+                        use_torch=True
+                    )
 
                 # Run evaluation
-                self._log.info(f'Running evaluation of {ckpt_path}')
-                start_time = time.time()
-                eval_dir = os.path.join(
-                    self._exp_conf.eval_dir, f'step_{self.trained_steps}')
-                os.makedirs(eval_dir, exist_ok=True)
-                ckpt_metrics = self.eval_fn(
-                    eval_dir, valid_loader, device,
-                    noise_scale=self._exp_conf.noise_scale
-                )
-                eval_time = time.time() - start_time
-                self._log.info(f'Finished evaluation in {eval_time:.2f}s')
-            else:
-                ckpt_metrics = None
-                eval_time = None
+                if valid_loader:
+                    self._log.info(f'Running evaluation on step {self.trained_steps}')
+                    start_time = time.time()
+                    eval_dir = os.path.join(
+                        self._exp_conf.eval_dir, f'step_{self.trained_steps}')
+                    os.makedirs(eval_dir, exist_ok=True)
+                    ckpt_metrics = self.eval_fn(
+                        eval_dir, valid_loader, device,
+                        noise_scale=self._exp_conf.noise_scale
+                    )
+                    eval_time = time.time() - start_time
+                    self._log.info(f'Finished evaluation in {eval_time:.2f}s')
 
             # Remote log to Wandb.
             if self._use_wandb:
-                step_time = time.time() - step_time
-                example_per_sec = self._exp_conf.batch_size / step_time
-                step_time = time.time()
                 wandb_logs = {
                     'loss': loss,
                     'rotation_loss': aux_data['rot_loss'],
@@ -413,7 +405,6 @@ class Experiment:
                     'examples_per_sec': example_per_sec,
                     'num_epochs': self.trained_epochs,
                 }
-
                 # Stratified losses
                 for k,v in aux_data.items() :
                     if "_loss" in k and "batch_" in k and (f'{k[6:]}_t_filter' not in self._exp_conf or train_feats['t'][0]<self._exp_conf[f'{k[6:]}_t_filter']):
@@ -500,6 +491,11 @@ class Experiment:
                 sample_metrics['diffused_percentage'] = percent_diffused
                 sample_metrics['sample_path'] = saved_path
                 sample_metrics['gt_pdb'] = pdb_names[i]
+                sample_metrics['lddt'] = float(lddt_ca(
+                    infer_out['final_atom_positions'][i],
+                    infer_out['all_atom_positions'][i],
+                    infer_out['all_atom_mask'][i],
+                    per_residue=False))
                 ckpt_eval_metrics.append(sample_metrics)
 
         # Save metrics as CSV.
@@ -507,7 +503,6 @@ class Experiment:
         ckpt_eval_metrics = pd.DataFrame(ckpt_eval_metrics)
         ckpt_eval_metrics.to_csv(eval_metrics_csv_path, index=False)
         return ckpt_eval_metrics
-
     def loss_fn(self, batch):
         """Computes loss and auxiliary data.
 
@@ -519,19 +514,24 @@ class Experiment:
             loss: Final training loss scalar.
             aux_data: Additional logging data.
         """
+
         self_condition = None
+        model_out = None
 
         if self._model_conf.embed.embed_self_conditioning and self._generator.random() > 0.5:
             prev_batch = {}
-            # prepare common feature for both step
             prev_batch = ({k:v for k,v in batch.items() if "self_condition_" not in k})
-            # prepare diffused feature for prev step
             prev_batch.update({k[len("self_condition_"):]:v for k,v in batch.items() if "self_condition_" in k})
             with torch.no_grad():
                 self_condition = self._model(prev_batch)
                 if self._generator.random() < 0.5:
                     self_condition = {k:v for k,v in self_condition.items() if  k not in ['edge_embed','node_embed']}
-        model_out = self._model(batch,self_condition=self_condition)
+        if self._conf.model.profile:
+        # with torch.autograd.profiler.profile(use_cuda=True,profile_memory=True,with_stack=True,use_cpu=False,use_kineto=True) as prof:
+            with torch.autograd.profiler.profile(use_cuda=True,profile_memory=True,with_stack=False) as prof:
+                model_out = self._model(batch,self_condition=self_condition,)
+        else:
+            model_out = self._model(batch,self_condition=self_condition)
         bb_mask = batch['res_mask']
         diffuse_mask = 1 - batch['fixed_mask']
         loss_mask = bb_mask * diffuse_mask
@@ -625,8 +625,41 @@ class Experiment:
         dist_mat_loss *= self._exp_conf.dist_mat_loss_weight
         dist_mat_loss *= batch['t'] < self._exp_conf.dist_mat_loss_t_filter
         dist_mat_loss *= self._exp_conf.aux_loss_weight
-
-        # Fape Loss
+       
+        # Fape Loss 
+        # rename_dict = compute_renamed_ground_truth(batch,model_out['positions'])
+        # alt_naming_is_better = rename_dict['alt_naming_is_better']
+        # renamed_atom14_gt_positions = rename_dict['renamed_atom14_gt_positions']
+        # renamed_atom14_gt_exists = rename_dict['renamed_atom14_gt_exists']
+        # renamed_gt_frames = (
+        #     1.0 - alt_naming_is_better[..., None, None, None]
+        # ) * batch["rigidgroups_gt_frames"] + alt_naming_is_better[
+        #     ..., None, None, None
+        # ] * batch["rigidgroups_alt_gt_frames"]
+        # sidechain_frames = model_out['sidechain_frames']
+        # batch_dims = sidechain_frames.shape[:-4]
+        # sidechain_frames = sidechain_frames.view(*batch_dims, -1, 4, 4)
+        # sidechain_frames = ru.Rigid.from_tensor_4x4(sidechain_frames)
+        # renamed_gt_frames = renamed_gt_frames.view(*batch_dims, -1, 4, 4)
+        # renamed_gt_frames = ru.Rigid.from_tensor_4x4(renamed_gt_frames)
+        # rigidgroups_gt_exists = batch["rigidgroups_gt_exists"].reshape(*batch_dims, -1)
+        # sidechain_atom_pos = model_out["positions"]
+        # sidechain_atom_pos = sidechain_atom_pos.view(*batch_dims, -1, 3)
+        # renamed_atom14_gt_positions = renamed_atom14_gt_positions.view(
+        #     *batch_dims, -1, 3
+        # )
+        # renamed_atom14_gt_exists = renamed_atom14_gt_exists.view(*batch_dims, -1)
+        # fape_loss = compute_fape(
+        #     pred_frames= sidechain_frames, 
+        #     target_frames= renamed_gt_frames,
+        #     frames_mask= rigidgroups_gt_exists,
+        #     pred_positions =sidechain_atom_pos,
+        #     target_positions = renamed_atom14_gt_positions,
+        #     positions_mask = renamed_atom14_gt_exists,
+        #     length_scale=1/self._exp_conf.coordinate_scaling,
+        #     l1_clamp_distance=10)
+        
+        # Backbone Fape Loss
         fape_loss = compute_fape(
             pred_frames=ru.Rigid.from_tensor_7(model_out['rigids']),
             target_frames=ru.Rigid.from_tensor_7(batch['rigids_t']),
@@ -637,10 +670,27 @@ class Experiment:
             length_scale=1/self._exp_conf.coordinate_scaling,
             l1_clamp_distance=10,
         )
+
         fape_loss *= self._exp_conf.fape_loss_weight
         fape_loss *= batch['t'] < self._exp_conf.fape_loss_t_filter
 
-
+        # chi_loss = supervised_chi_loss(
+        #     # [B,1,N,7,2] add structure block dimision 
+        #     angles_sin_cos= model_out["angles"][None,...],
+        #     unnormalized_angles_sin_cos=model_out["unnormalized_angles"][None,...],
+        #     aatype=batch["aatype"],
+        #     seq_mask=batch["res_mask"].float(),
+        #     chi_mask=batch["chi_mask"],
+        #     chi_angles_sin_cos=batch["chi_angles_sin_cos"],
+        #     chi_weight=self._exp_conf.chi_weight,
+        #     angle_norm_weight=self._exp_conf.angle_norm_weight
+        #     )
+        # chi_loss *= batch['t'] < self._exp_conf.sidechain_loss_t_filter
+        lddt = lddt_ca(
+            model_out['final_atom_positions'],
+            batch['all_atom_positions'],
+            batch['atom37_atom_exists'],
+            per_residue=False)
         final_loss = (
             rot_loss
             + trans_loss
@@ -654,17 +704,20 @@ class Experiment:
 
         aux_data = {
             'batch_train_loss': final_loss,
-            'batch_rot_loss': rot_loss,
-            'batch_trans_loss': trans_loss,
-            'batch_bb_atom_loss': bb_atom_loss,
-            'batch_dist_mat_loss': dist_mat_loss,
-            "batch_fape_loss": fape_loss,
-            'total_loss': normalize_loss(final_loss),
-            'rot_loss': normalize_loss(rot_loss),
-            'trans_loss': normalize_loss(trans_loss),
-            'bb_atom_loss': normalize_loss(bb_atom_loss),
-            'dist_mat_loss': normalize_loss(dist_mat_loss),
-            'fape_loss': normalize_loss(fape_loss),
+            'batch_rot_loss': rot_loss.detach(),
+            'batch_trans_loss': trans_loss.detach(),
+            'batch_bb_atom_loss': bb_atom_loss.detach(),
+            'batch_dist_mat_loss': dist_mat_loss.detach(),
+            "batch_fape_loss": fape_loss.detach(),
+            "batch_lddt_loss" : lddt.detach(),
+            # "batch_chi_loss": chi_loss.detach(),
+            'total_loss': normalize_loss(final_loss).detach(),
+            'rot_loss': normalize_loss(rot_loss).detach(),
+            'trans_loss': normalize_loss(trans_loss).detach(),
+            'bb_atom_loss': normalize_loss(bb_atom_loss).detach(),
+            'dist_mat_loss': normalize_loss(dist_mat_loss).detach(),
+            "fape_loss": normalize_loss(fape_loss).detach(),
+            # "chi_loss": normalize_loss(chi_loss).detach(),
             'examples_per_step': torch.tensor(batch_size),
             'res_length': torch.mean(torch.sum(bb_mask, dim=-1)),
         }
@@ -680,29 +733,6 @@ class Experiment:
         assert final_loss.shape == (batch_size,)
         assert batch_loss_mask.shape == (batch_size,)
         return normalize_loss(final_loss), aux_data
-
-    def _calc_trans_0(self, trans_score, trans_t, t):
-        beta_t = self._diffuser._se3_diffuser._r3_diffuser.marginal_b_t(t)
-        beta_t = beta_t[..., None, None]
-        cond_var = 1 - torch.exp(-beta_t)
-        return (trans_score * cond_var + trans_t) / torch.exp(-1/2*beta_t)
-
-    def _set_t_feats(self, feats, t, t_placeholder):
-        feats['t'] = t * t_placeholder
-        rot_score_scaling, trans_score_scaling = self.diffuser.score_scaling(t)
-        feats['rot_score_scaling'] = rot_score_scaling * t_placeholder
-        feats['trans_score_scaling'] = trans_score_scaling * t_placeholder
-        return feats
-
-    def forward_traj(self, x_0, min_t, num_t):
-        forward_steps = np.linspace(min_t, 1.0, num_t)[:-1]
-        x_traj = [x_0]
-        for t in forward_steps:
-            x_t = self.diffuser.se3_diffuser._r3_diffuser.forward(
-                x_traj[-1], t, num_t)
-            x_traj.append(x_t)
-        x_traj = torch.stack(x_traj, axis=0)
-        return x_traj
 
     def inference_fn(
             self,
@@ -740,14 +770,13 @@ class Experiment:
         all_trans_0_pred = []
         all_bb_0_pred = []
         with torch.no_grad():
-            model_out=None
+            model_out = None
             for t in reverse_steps:
-                if not (self._model_conf.embed.embed_self_conditioning and self_condition):
-                    model_out=None
                 if t > min_t:
-                    # TODO change selfcondition logic and switch Score model by switch embed model and train
+                    if not (self._model_conf.embed.embed_self_conditioning and self_condition):
+                        model_out=None
                     sample_feats = self._set_t_feats(sample_feats, t, t_placeholder)
-                    model_out = self.model(sample_feats,self_condition=model_out)
+                    model_out = self._model(sample_feats,self_condition=model_out)
                     rot_score = model_out['rot_score']
                     trans_score = model_out['trans_score']
                     rigid_pred = model_out['rigids']
@@ -798,6 +827,9 @@ class Experiment:
 
         ret = {
             'prot_traj': all_bb_prots,
+            "final_atom_positions": model_out["final_atom_positions"],
+            'all_atom_positions': sample_feats['all_atom_positions'],
+            "all_atom_mask": model_out['final_atom_mask'],
         }
         if aux_traj:
             ret['rigid_traj'] = all_rigids
@@ -807,16 +839,92 @@ class Experiment:
             ret['prot_0_traj'] = all_bb_0_pred
         return ret
 
+    def _calc_trans_0(self, trans_score, trans_t, t):
+        beta_t = self._diffuser._se3_diffuser._r3_diffuser.marginal_b_t(t)
+        beta_t = beta_t[..., None, None]
+        cond_var = 1 - torch.exp(-beta_t)
+        return (trans_score * cond_var + trans_t) / torch.exp(-1/2*beta_t)
 
+    def _set_t_feats(self, feats, t, t_placeholder):
+        feats['t'] = t * t_placeholder
+        rot_score_scaling, trans_score_scaling = self.diffuser.score_scaling(t)
+        feats['rot_score_scaling'] = rot_score_scaling * t_placeholder
+        feats['trans_score_scaling'] = trans_score_scaling * t_placeholder
+        return feats
+    
 @hydra.main(version_base=None, config_path="../config", config_name="base")
 def run(conf: DictConfig) -> None:
 
-    # Fixes bug in https://github.com/wandb/wandb/issues/1525
     os.environ["WANDB_START_METHOD"] = "thread"
-
     exp = Experiment(conf=conf)
     exp.start_training()
-
-
+    
 if __name__ == '__main__':
     run()
+
+
+
+'''
+    model input:
+        'aatype': torch.Size([2, 256]), 
+        'seq_idx': torch.Size([2, 256]), 
+        'chain_idx': torch.Size([2, 256]), 
+        'residx_atom14_to_atom37': torch.Size([2, 256, 14]), 
+        'residx_atom37_to_atom14': torch.Size([2, 256, 37]), 
+        'residue_index': torch.Size([2, 256]), 
+        'res_mask': torch.Size([2, 256]), 
+        'atom37_pos': torch.Size([2, 256, 37, 3]), 
+        'atom37_mask': torch.Size([2, 256, 37]), 
+        'atom14_pos': torch.Size([2, 256, 14, 3]), 
+        'rigidgroups_0': torch.Size([2, 256, 8, 4, 4]), 
+        'rigidgroups_gt_exists': torch.Size([2, 256, 8]), 
+        'rigidgroups_gt_frames': torch.Size([2, 256, 8, 4, 4]), 
+        'rigidgroups_alt_gt_frames': torch.Size([2, 256, 8, 4, 4]), 
+        'torsion_angles_sin_cos': torch.Size([2, 256, 7, 2]), 
+        'torsion_angles_mask': torch.Size([2, 256, 4]), 
+        'all_atom_positions': torch.Size([2, 256, 37, 3]), 
+        'atom37_atom_exists': torch.Size([2, 256, 37]), 
+        'atom14_gt_exists': torch.Size([2, 256, 14]), 
+        'atom14_gt_positions': torch.Size([2, 256, 14, 3]), 
+        'atom14_alt_gt_exists': torch.Size([2, 256, 14]), 
+        'atom14_alt_gt_positions': torch.Size([2, 256, 14, 3]), 
+        'atom14_atom_exists': torch.Size([2, 256, 14]), 
+        'atom14_atom_is_ambiguous': torch.Size([2, 256, 14]), 
+        'fixed_mask': torch.Size([2, 256]), 
+        'sc_ca_t': torch.Size([2, 256, 3]), 
+        'trans_score': torch.Size([2, 256, 3]), 
+        'rot_score': torch.Size([2, 256, 3]), 
+        'template_mask': torch.Size([2, 4]), 
+        'template_aatype': torch.Size([2, 4, 256]), 
+        'template_pseudo_beta': torch.Size([2, 4, 256, 3]), 
+        'template_pseudo_beta_mask': torch.Size([2, 4, 256]), 
+        'template_all_atom_mask': torch.Size([2, 4, 256, 37]), 
+        'template_all_atom_positions': torch.Size([2, 4, 256, 37, 3]), 
+        'template_torsion_angles_mask': torch.Size([2, 4, 256, 7]), 
+        'template_torsion_angles_sin_cos': torch.Size([2, 4, 256, 7, 2]), 
+        'template_alt_torsion_angles_sin_cos': torch.Size([2, 4, 256, 7, 2]), 
+        'template_sum_probs': torch.Size([2, 4, 1]), 
+        't': torch.Size([2]), 
+        'rot_score_scaling': torch.Size([2]), 
+        'trans_score_scaling': torch.Size([2]), 
+        'rigids_0': torch.Size([2, 256, 7]), 
+        'rigids_t': torch.Size([2, 256, 7]), 
+        'rigids_all_0': torch.Size([2, 256, 8, 7])
+
+    model output:
+        'rigids': torch.Size([2, 256, 7]), 
+        'psi': torch.Size([2, 256, 2]), 
+        'rot_score': torch.Size([2, 256, 3]), 
+        'trans_score': torch.Size([2, 256, 3]), 
+        'atom14': torch.Size([2, 256, 14, 3]), 
+        'atom37': torch.Size([2, 256, 37, 3]), 
+        'node_embed': torch.Size([2, 256, 256]), 
+        'edge_embed': torch.Size([2, 256, 256, 128]), 
+        'all_rigids': torch.Size([2, 256, 8, 7]), 
+        'sidechain_frames': torch.Size([2, 256, 8, 4, 4]), 
+        'unnormalized_angles': torch.Size([2, 256, 7, 2]), 
+        'angles': torch.Size([2, 256, 7, 2]), 
+        'positions': torch.Size([2, 256, 14, 3]), 
+        'final_atom_positions': torch.Size([2, 256, 37, 3]), 
+        'final_atom_mask': torch.Size([2, 256, 37])
+    '''

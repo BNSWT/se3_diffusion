@@ -18,10 +18,11 @@ Code based on official github repo [SE3 Diffusion](https://github.com/jasonkyuyi
 	- [Structure Prediction Data](#structure-prediction-data)
 - [Training](#training)
   - [Standard Diffusion Training](#standard-diffusion-training)
-<!--   - [Structure Prediction Training](#structure-prediction-training) -->
+  - [Structure Prediction Diffusion Training](#structure-prediction-diffusion-training)
 - [Inference](#inference)
   - [Standard Diffusion Inference](#standard-diffusion-inference)
 <!--   - [Structure Prediction Inference](#structure-prediction-inference) -->
+- [Update History](#update-history)
 - [Related Efforts](#related-efforts)
 - [Maintainers](#maintainers)
 - [Contributing](#contributing)
@@ -29,29 +30,6 @@ Code based on official github repo [SE3 Diffusion](https://github.com/jasonkyuyi
 
 ## Background
 
-Standard Readme started with the issue originally posed by [@maxogden](https://github.com/maxogden) over at [feross/standard](https://github.com/feross/standard) in [this issue](https://github.com/feross/standard/issues/141), about whether or not a tool to standardize readmes would be useful. A lot of that discussion ended up in [zcei's standard-readme](https://github.com/zcei/standard-readme/issues/1) repository. While working on maintaining the [IPFS](https://github.com/ipfs) repositories, I needed a way to standardize Readmes across that organization. This specification started as a result of that.
-
-> Your documentation is complete when someone can use your module without ever
-having to look at its code. This is very important. This makes it possible for
-you to separate your module's documented interface from its internal
-implementation (guts). This is good because it means that you are free to
-change the module's internals as long as the interface remains the same.
-
-> Remember: the documentation, not the code, defines what a module does.
-
-~ [Ken Williams, Perl Hackers](http://mathforum.org/ken/perl_modules.html#document)
-
-Writing READMEs is way too hard, and keeping them maintained is difficult. By offloading this process - making writing easier, making editing easier, making it clear whether or not an edit is up to spec or not - you can spend less time worrying about whether or not your initial documentation is good, and spend more time writing and using code.
-
-By having a standard, users can spend less time searching for the information they want. They can also build tools to gather search terms from descriptions, to automatically run example code, to check licensing, and so on.
-
-The goals for this repository are:
-
-1. A well defined **specification**. This can be found in the [Spec document](spec.md). It is a constant work in progress; please open issues to discuss changes.
-2. **An example README**. This Readme is fully standard-readme compliant, and there are more examples in the `example-readmes` folder.
-3. A **linter** that can be used to look at errors in a given Readme. Please refer to the [tracking issue](https://github.com/RichardLitt/standard-readme/issues/5).
-4. A **generator** that can be used to quickly scaffold out new READMEs. See [generator-standard-readme](https://github.com/RichardLitt/generator-standard-readme).
-5. A **compliant badge** for users. See [the badge](#badge).
 
 ## Install
 
@@ -89,9 +67,9 @@ rsync -rlpt -v -z --delete --port=33444 rsync.rcsb.org::ftp_data/structures/divi
 
 gzip -d ./data/mmCIF/**/*.gz
 
-wget https://ftp.pdbj.org/pub/pdb/data/status/obsolete.dat  ./strcture_prediction/data/mmCIF/
-
-python data/process_pdb_dataset.py --mmcif_dir ./mmCIF --num_processes 20
+# --dump_chain_pdb --dump_chain_fasta (dump pdb and fatsa of single chain for further clustring)
+# --mode update (update metadata and processed pickel without overwritten old)
+python data/process_pdb_dataset.py --num_processes 20
 ```
 
 See the script for more options. Each mmCIF will be written as a pickle file that we read and process in the data loading pipeline. A metadata.csv will be saved that contains unique assemble unit defined by [pdbx_struct_assembly](https://mmcif.wwpdb.org/dictionaries/mmcif_pdbx_v50.dic/Categories/pdbx_struct_assembly.html) in each mmcif file.
@@ -112,6 +90,9 @@ aws s3 sync --no-sign-request s3://openfold/pdb/ ./strcture_prediction/OpenProte
 ```
 Process OpenProteinSet templates file with data/mmCIF cif file.   
 ```sh
+# fix discripency of pdb name between mmCIF and OpenProteinSet
+wget https://ftp.pdbj.org/pub/pdb/data/status/obsolete.dat  ./strcture_prediction/data/mmCIF/
+# data preprocess
 python structure_prediction/data/process_pdb_dataset.py --num_processes 20 
 ```
 it shoulbe noted that **Standard Diffusion Data** suggested to be prepared brefore process strcture prediction data. As it save template release date cache in data/metadata.csv. This cache can boost at least 2 times speed up.
@@ -119,6 +100,18 @@ it shoulbe noted that **Standard Diffusion Data** suggested to be prepared brefo
 ## Training
 
 ### Standard Diffusion Training
+Train scaffold generation model with 4 gpu in DDP mode, log with W&B
+```sh
+torchrun --nproc_per_node 4 experiments/train_se3_diffusion.py experiment.num_gpus=4 experiment.use_ddp=True experiment.use_wandb=True
+```
+If you want to train on oligomer data rather than only monomer(it will make dataset 2x size than only monomer) , append this parameter
+```sh
+# more oligomer type can be appended, view full ologomer type of pdb in the config/base.yaml(keyword:allowed_oligomer)
+data.filtering.allowed_oligomer=["monomer","dimer"]
+```
+<!-- ### Structure Prediction Training -->
+
+### Structure Prediction Diffusion Training
 Train scaffold generation model with 4 gpu in DDP mode, log with W&B
 ```sh
 torchrun --nproc_per_node 4 experiments/train_se3_diffusion.py experiment.num_gpus=4 experiment.use_ddp=True experiment.use_wandb=True
@@ -200,6 +193,15 @@ cycle_3_fades : python experiments/inference_se3_diffusion.py inference.name=mpn
 </div>
 
 <!-- ### Structure Prediction Inference -->
+
+## Update History
+### Structure Prediction
+ * 2023.6.14 Fisrt release version of strcture prediction pretraining with diffusion model
+### Standard Diffusion
+ * 2023.6.14 :  
+ 	1. Add The Standard diffusion data process and training can comprimise oligomer.
+	2. Change set deafult self-condition embedder to template embedder(include frame rotation and torsion angle(not used now), use triagular update, show promising performence improvement)   
+	3. Fix Bug self-condition is trained on the output of current step in previous version
 
 ## Related Efforts
 

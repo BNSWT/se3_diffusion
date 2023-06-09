@@ -167,8 +167,6 @@ outputs/
 #PDB processed dataset
 data/processed_pdb/
 data/processed_pdb_openfold/
-structure_prediction/data/AFDB_Cluster/
-structure_prediction/data/OpenProteinSet/
 #PDBBind dataset
 DiffusionProteinLigand/data/PDBBind*
 
@@ -180,3 +178,21 @@ slurm_output/
 
 wandb/
 .vscode/
+
+
+
+ckpt/
+output/
+wandb/
+debug/
+eval_outputs/
+structure_prediction/data/AFDB_Cluster/
+structure_prediction/data/OpenProteinSet/
+structure_prediction/data/processed_pdb/
+structure_prediction/data/cameo/
+structure_prediction/data/casp14/
+structure_prediction/ckpt/
+structure_prediction/output/
+structure_prediction/wandb/
+structure_prediction/eval_outputs/
+structure_prediction/wandb_output/
