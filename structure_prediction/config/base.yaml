@@ -12,7 +12,7 @@ data:
     # Selects a subset of examples. Useful for debugging.
     subset: null
   train:
-    delta_t_range: [1, 2, 3, 4, 5]
+    delta_t_range: [0]
     crop: False
     crop_size: 256
     max_template_hits: 4
@@ -70,36 +70,34 @@ model:
   dropout: 0.0
   
   embed:
+    feature:
+      aatype: True
+      index: False
+      rel_pos: 32
+      t: 32
+      distogram:
+        min_bin: 1e-5
+        max_bin: 20.0
+        no_bins: 22
+      
+    self_condition:
+      # baseline: ca distogram, template: af2 template feature, null: no self-condition
+      version: template
+      # now aatype process has two way: mask(mask all residue identity),null: same as input,
+      aatype: null
+      # backbone,all_atom
+      all_atom_mask: backbone
     node_embed_size: ${model.node_embed_size}
     edge_embed_size: ${model.edge_embed_size}
-
-    aatype_embed_size: 21
-    # embedding of relative position in pair
-    rel_pos_emded_size: 32
-    # embedding of absolute position in sequence
-    index_embed_size: null
-    t_embed_size: 32
-    template_embed_size: 64
-
-    min_bin: 1e-5
-    max_bin: 20.0
-    no_bins: 22
-    # baseline : ca distogram, template : [af2 template feature]
-    embed_self_conditioning: template
     inf: 1e9
     eps: 1e-6
 
     template:
       c_s: ${model.node_embed_size}
       c_z: ${model.edge_embed_size}
-      c_t: ${model.embed.template_embed_size}
+      c_t: 64
       inf: 1e9
       eps: 1e-6
-
-      # control self condition embedding feature  
-      self_condition:
-        # now aatype process has two way: mask(mask all residue identity),atom_mask_match(match the final_atom_mask),
-        aatype: mask
 
       distogram:
         min_bin: 3.25
@@ -113,10 +111,10 @@ model:
       
       template_pair_embedder:
         c_in: 88
-        c_out: ${model.embed.template_embed_size}
+        c_out: ${model.embed.template.c_t}
       
       template_pair_stack:
-        c_t: ${model.embed.template_embed_size}
+        c_t: ${model.embed.template.c_t}
         c_hidden_tri_mul: 32
         pair_transition_n: 2
         dropout_rate: 0.25
@@ -124,7 +122,7 @@ model:
 
       template_cross_embedder:
         template_pointwise_attention:
-          c_t: ${model.embed.template_embed_size}
+          c_t: ${model.embed.template.c_t}
           c_z: ${model.edge_embed_size}
           c_hidden: 16
           no_heads: 4
@@ -162,7 +160,7 @@ experiment:
   batch_size: 8
   copy_num : 1
   num_loader_workers: 5
-  num_epoch: 30
+  num_epoch: 95
   learning_rate: 0.0001
   max_squared_res: 300000
   prefetch_factor: 100

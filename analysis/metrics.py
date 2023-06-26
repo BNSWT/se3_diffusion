@@ -32,6 +32,7 @@ CA_VIOLATION_METRICS = [
 
 EVAL_METRICS = [
     'tm_score', 
+    'lddt'
 ]
 
 ALL_METRICS = (

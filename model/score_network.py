@@ -96,31 +96,31 @@ class Embedder(nn.Module):
         edge_embed_size = self._model_conf.edge_embed_size
 
         # Time step embedding
-        node_in = self._embed_conf.t_embed_size + 1
-        edge_in = (self._embed_conf.t_embed_size + 1) * 2
+        node_in = self._embed_conf.feature.t + 1 + 21
+        edge_in = (self._embed_conf.feature.t + 1 + 21) * 2
 
         # Sequence index embedding
-        if self._embed_conf.index_embed_size:
+        if self._embed_conf.feature.index:
             self.index_embedder = fn.partial(
                 get_index_embedding,
-                embed_size=self._embed_conf.index_embed_size
+                embed_size=self._embed_conf.feature.index
             )
-            node_in += self._embed_conf.index_embed_size
-            edge_in += self._embed_conf.index_embed_size
+            node_in += self._embed_conf.feature.index
+            edge_in += self._embed_conf.feature.index
         # relative embedding
-        if self._embed_conf.rel_pos_emded_size:
-            self.rel_pos_embedder = PositinalEmbedder(max_relative_idx=self._embed_conf.rel_pos_emded_size)
+        if self._embed_conf.feature.rel_pos:
+            self.rel_pos_embedder = PositinalEmbedder(max_relative_idx=self._embed_conf.feature.rel_pos)
             edge_in += self.rel_pos_embedder.no_bins
 
         # self-condition embedding
-        if self._embed_conf.embed_self_conditioning == 'baseline':
+        if self._embed_conf.self_condition.version == 'baseline':
             edge_in += self._embed_conf.no_bins
-        elif self._embed_conf.embed_self_conditioning == 'template':
+        elif self._embed_conf.self_condition.version == 'template':
             self.template_embedder = TemplateEmbedder(self._embed_conf.template)
-        elif not self._embed_conf.embed_self_conditioning:
+        elif not self._embed_conf.self_condition.version:
             pass
         else:
-            raise ValueError(f"self_condition embedder : {self._embed_conf.embed_self_conditioning} is not implemented")
+            raise ValueError(f"self_condition embedder : {self._embed_conf.self_condition.version} is not implemented")
         
         self.node_embedder = nn.Sequential(
             nn.Linear(node_in, node_embed_size),
@@ -142,7 +142,7 @@ class Embedder(nn.Module):
 
         self.timestep_embedder = fn.partial(
             get_timestep_embedding,
-            embedding_dim=self._embed_conf.t_embed_size
+            embedding_dim=self._embed_conf.feature.t
         )
 
     def _cross_concat(self, feats_1d, num_batch, num_res):
@@ -179,28 +179,54 @@ class Embedder(nn.Module):
         fixed_mask = fixed_mask[..., None]
         prot_t_embed = torch.tile(
             self.timestep_embedder(t)[:, None, :], (1, num_res, 1))
-        prot_t_embed = torch.cat([prot_t_embed, fixed_mask], dim=-1)
+        prot_t_embed = torch.cat(
+        [   
+            prot_t_embed,
+            fixed_mask,
+            torch.nn.functional.one_hot((batch["aatype"] if self._embed_conf.feature.aatype else torch.ones_like(batch["aatype"])*resname_to_idx["UNK"]),21).to(torch.float32)
+        ],
+        dim=-1)
         node_feats = [prot_t_embed]
         pair_feats = [self._cross_concat(prot_t_embed, num_batch, num_res)]
 
         # Positional index features.
-        if self._embed_conf.index_embed_size:
+        if self._embed_conf.feature.index:
             node_feats.append(self.index_embedder(seq_idx))
             rel_seq_offset = seq_idx[:, :, None] - seq_idx[:, None, :]
             rel_seq_offset = rel_seq_offset.reshape([num_batch, num_res**2])
             pair_feats.append(self.index_embedder(rel_seq_offset))
         
         # Relative position embedding
-        if self._embed_conf.rel_pos_emded_size:
+        if self._embed_conf.feature.rel_pos:
             pair_feats.append(self.rel_pos_embedder(batch).reshape([num_batch, num_res**2, -1]))
 
+        # slef_condition feature process
+        if self_condition:
+            batch_size,res_num = batch["aatype"].shape[:2]
+            standard_atom_mask =  self_condition["final_atom_positions"].new_tensor(STANDARD_ATOM_MASK)
+            if not self._embed_conf.self_condition.aatype:
+                self_condition['aatype'] = batch["aatype"]
+            elif self._embed_conf.self_condition.aatype=='mask':
+                self_condition["aatype"] = torch.ones([batch_size,res_num],dtype=torch.long,device=batch["aatype"].device)*resname_to_idx['GLY']
+            else:
+                raise ValueError(f"self_condition aatype : {self._embed_conf.self_condition.aatype} is not implemented")
+            
+            if not self._embed_conf.self_condition.all_atom_mask:
+                self_condition["final_atom_mask"] = standard_atom_mask[self_condition["aatype"]]
+            elif self._embed_conf.self_condition.all_atom_mask=='backbone':
+                self_condition["final_atom_mask"] = self_condition["final_atom_mask"]*standard_atom_mask[resname_to_idx['GLY']][None,None,:]
+            else:
+                raise ValueError(f"self_condition all_atom_mask : {self._embed_conf.self_condition.all_atom_mask} is not implemented")
+
+            self_condition["final_atom_positions"] = self_condition["final_atom_positions"]*self_condition["final_atom_mask"][...,None]
+
         # Self-conditioning distogram.
-        if self._embed_conf.embed_self_conditioning == 'baseline':
+        if self._embed_conf.self_condition == 'baseline':
             sc_dgram = du.calc_distogram(
                 torch.zeros_like(batch["rigids_t"][...,:4]) if not self_condition else self_condition["rigids"],
-                self._embed_conf.min_bin,
-                self._embed_conf.max_bin,
-                self._embed_conf.no_bins,
+                self._embed_conf.feature.distogram.min_bin,
+                self._embed_conf.feature.distogram.max_bin,
+                self._embed_conf.feature.distogram.no_bins,
             )
             pair_feats.append(sc_dgram.reshape([num_batch, num_res**2, -1]))
 
@@ -208,7 +234,7 @@ class Embedder(nn.Module):
         edge_embed = self.edge_embedder(torch.cat(pair_feats, dim=-1).float())
         edge_embed = edge_embed.reshape([num_batch, num_res, num_res, -1])
 
-        if self._embed_conf.embed_self_conditioning == 'template':
+        if self._embed_conf.self_condition.version == 'template':
             #### template embed and self-condition embed ####
             seq_mask = batch["res_mask"].float()
             pair_mask = seq_mask[...,:,None] * seq_mask[...,None,:]
@@ -463,30 +489,12 @@ class TemplateEmbedder(nn.Module):
 
         self_condition_embeds = {}
         
-        aatype = None
-        if self.config.self_condition.aatype=='atom_mask_match':
-            # [21, 37]
-            standard_atom_mask =  out["final_atom_positions"].new_tensor(STANDARD_ATOM_MASK)
-            # [B, N, 1, 37]
-            all_atom_mask_expanded = out["final_atom_mask"][...,None,:]
-            # [B, N, 21, 37]
-            aatype = torch.argmax(torch.eq(all_atom_mask_expanded, standard_atom_mask)[...,0].float(),dim=-1)
-            out["final_atom_mask"] = standard_atom_mask[aatype]
-            out["final_atom_positions"] = out["final_atom_positions"]*out["final_atom_mask"][...,None]
-        elif self.config.self_condition.aatype=='mask':
-            standard_atom_mask =  out["final_atom_positions"].new_tensor(STANDARD_ATOM_MASK)
-            aatype = torch.ones([batch_size,res_num],dtype=torch.long,device=pair_mask.device)*resname_to_idx['GLY']
-            out["final_atom_mask"] = standard_atom_mask[aatype]
-            out["final_atom_positions"] = out["final_atom_positions"]*out["final_atom_mask"][...,None]
-        else:
-            raise ValueError(f"self_condition aatype : {self.config.self_condition.aatype} is not implemented")
-        
         torsion_angles, torsion_mask = all_atom.prot_to_torsion_angles(
-            aatype,out["final_atom_positions"],out["final_atom_mask"])
-        pseudo_beta , pseudo_beta_mask = pseudo_beta_fn(aatype,out["final_atom_positions"],out["final_atom_mask"])
+            out['aatype'],out["final_atom_positions"],out["final_atom_mask"])
+        pseudo_beta , pseudo_beta_mask = pseudo_beta_fn(out['aatype'],out["final_atom_positions"],out["final_atom_mask"])
         
         condition_feats = {
-            "template_aatype" : aatype,
+            "template_aatype" : out['aatype'],
             "template_all_atom_positions" : out["final_atom_positions"],
             "template_all_atom_mask" : out["final_atom_mask"],
             "template_pseudo_beta" : pseudo_beta,
@@ -543,115 +551,6 @@ class TemplateEmbedder(nn.Module):
         }
 
         return ret
-
-class FullEmbedder(nn.Module):
-
-    def __init__(self, model_conf):
-        super(FullEmbedder, self).__init__()
-        self._model_conf = model_conf
-
-        aatype_embed_size = self._model_conf.aatype_embed_size
-        t_embed_size = self._model_conf.t_embed_size
-
-        rel_pos_embed_size = 2*self._model_conf.rel_pos_emded_size + 2 + 2
-
-        node_embed_size = self._model_conf.node_embed_size
-        edge_embed_size = self._model_conf.edge_embed_size
-
-        node_in_size = aatype_embed_size + t_embed_size
-        edge_in_size = (aatype_embed_size + t_embed_size)*2  + rel_pos_embed_size + self._model_conf.no_bins
-
-        self.node_embedder = nn.Sequential(
-            nn.Linear(node_in_size, node_embed_size),
-            nn.ReLU(),
-            nn.Linear(node_embed_size, node_embed_size),
-            nn.ReLU(),
-            nn.Linear(node_embed_size, node_embed_size),
-            nn.LayerNorm(node_embed_size),
-        )
-
-        self.edge_embedder = nn.Sequential(
-            nn.Linear(edge_in_size, edge_embed_size),
-            nn.ReLU(),
-            nn.Linear(edge_embed_size, edge_embed_size),
-            nn.ReLU(),
-            nn.Linear(edge_embed_size, edge_embed_size),
-            nn.LayerNorm(edge_embed_size),
-        )
-
-        # TODO add relative position embedding in framdiff transformer because we delete index position embedding here
-        self.rel_pos_embedder = PositinalEmbedder(max_relative_idx=self._model_conf.rel_pos_emded_size)
-
-        self.timestep_embedder = fn.partial(
-            get_timestep_embedding,
-            embedding_dim=t_embed_size
-        )
-        
-        self.template_embedder = TemplateEmbedder(self._model_conf.template)
-        
-
-    def _cross_concat(self, feats_1d, num_batch, num_res):
-        return torch.cat([
-            torch.tile(feats_1d[:, :, None, :], (1, 1, num_res, 1)),
-            torch.tile(feats_1d[:, None, :, :], (1, num_res, 1, 1)),
-        ], dim=-1).float()
-    
-    def forward(
-            self,
-            batch,
-            t,
-            fixed_mask,
-            self_condition = None,
-        ):
-        """Embeds a set of inputs
-
-        Args:
-            batch : input feature.
-            t: Sampled t in [0, 1].
-            fixed_mask: mask of fixed (motif) residues.
-            self_conditioning: Mapping [str,Tensor]
-        Returns:
-            node_embed: [B, N, D_node]
-            edge_embed: [B, N, N, D_edge]
-        """
-        with torch.autograd.profiler.record_function("embedder"):
-            num_batch, num_res = batch["aatype"].shape[:2]
-            seq_mask = batch["res_mask"].float()
-            pair_mask = seq_mask[...,:,None] * seq_mask[...,None,:]
-            node_feats = [
-                torch.nn.functional.one_hot(batch["aatype"], self._model_conf.aatype_embed_size).to(torch.float32),
-                torch.tile(self.timestep_embedder(t)[:, None, :], (1, num_res, 1)),
-            ]
-            node_feats = torch.cat(node_feats, dim=-1).float()
-
-            pair_feats = [
-                self._cross_concat(node_feats, num_batch, num_res),
-                self.rel_pos_embedder(batch),
-                du.calc_distogram(
-                    batch["rigids_t"][...,4:],
-                    self._model_conf.min_bin,
-                    self._model_conf.max_bin,
-                    self._model_conf.no_bins,
-                ).reshape([num_batch, num_res, num_res, -1])
-            ]
-            pair_feats = torch.cat(pair_feats, dim=-1).float()
-            node_embed = self.node_embedder(node_feats)
-            edge_embed = self.edge_embedder(pair_feats)
-            #### template embed and self-condition embed ####
-            template_batch = {k:v for k,v in batch.items() if 'template_' in k} if batch["template_mask"].any() else None
-            template_node_embed,template_edge_embed = self.template_embedder(
-                node_embed=node_embed,
-                edge_embed=edge_embed,
-                pair_mask=pair_mask,
-                template_batch=template_batch,
-                self_condition=self_condition,
-                )
-
-            node_embed = node_embed + template_node_embed
-            edge_embed = edge_embed + template_edge_embed
-        return node_embed, edge_embed
-
-
 
 class ScoreNetwork(nn.Module):
 
@@ -814,100 +713,3 @@ class ScoreNetwork(nn.Module):
             self.atom_mask,
             self.lit_positions,
         )
-    
-class FullAtomScoreNetwork(ScoreNetwork):
-
-    def __init__(self, model_conf, diffuser):
-        super(ScoreNetwork, self).__init__()
-        self._model_conf = model_conf
-
-        self.embedding_layer = FullEmbedder(model_conf.embed)
-        self.diffuser = diffuser
-        self.score_model = ipa_pytorch.IpaScore(model_conf, diffuser)
-
-    def forward(self, input_feats, self_condition = None):
-        """Forward computes the reverse diffusion conditionals p(X^t|X^{t+1})
-        for each item in the batch
-
-        Args:
-            X: the noised samples from the noising process, of shape [Batch, N, D].
-                Where the T time steps are t=1,...,T (i.e. not including the un-noised X^0)
-
-        Returns:
-            model_out: dictionary of model outputs.
-        """
-
-        # Frames as [batch, res, 7] tensors.
-        bb_mask = input_feats['res_mask'].type(torch.float32)  # [B, N]
-        fixed_mask = input_feats['fixed_mask'].type(torch.float32)
-        edge_mask = bb_mask[..., None] * bb_mask[..., None, :]
-
-        # Initial embeddings of positonal and relative indices.
-        init_node_embed, init_edge_embed = self.embedding_layer(
-            batch=input_feats,
-            t=input_feats['t'],
-            fixed_mask=fixed_mask,
-            self_condition=self_condition,
-        )
-        edge_embed = init_edge_embed * edge_mask[..., None]
-        node_embed = init_node_embed * bb_mask[..., None]
-
-        # Run main network
-        model_out = self.score_model(node_embed, edge_embed, input_feats)
-
-        # Psi angle prediction
-        gt_psi = input_feats['torsion_angles_sin_cos'][..., 2, :]
-        psi_pred = self._apply_mask(
-            model_out['psi'], gt_psi, 1 - fixed_mask[..., None])
-        rigids_pred = model_out['final_rigids']
-        bb_representations = all_atom.compute_backbone(rigids_pred, psi_pred)
-
-        pred_out = {
-            #rigids
-            'rigids' : rigids_pred.to_tensor_7(),
-            # angle feature
-            'psi': psi_pred,
-            # score
-            'rot_score': model_out['rot_score'],
-            'trans_score': model_out['trans_score'],
-            # atom14 for backbone
-            'atom14' : bb_representations[-1].to(rigids_pred.device),
-            # atom37 for backbone
-            'atom37' : bb_representations[0].to(rigids_pred.device),
-            # latent embedding
-            'node_embed': model_out['node_embed'],
-            'edge_embed': model_out['edge_embed'],
-        }
-        if self._model_conf.sidechain:
-            # sidechain prediction
-            all_frames_to_global = self.torsion_angles_to_frames(
-                model_out['final_rigids'],
-                model_out['angles'],
-                input_feats["aatype"],
-            )
-
-            pred_xyz = self.frames_and_literature_positions_to_atom14_pos(
-                all_frames_to_global,
-                input_feats["aatype"],
-            )
-            final_atom_positions = atom14_to_atom37(
-                pred_xyz, input_feats
-            )
-            pred_out_sidechain = {
-                # rigids [B,N,8,7]
-                'all_rigids' : all_frames_to_global.to_tensor_7(),
-
-                # sidechain fape loss
-                'sidechain_frames' : all_frames_to_global.to_tensor_4x4(),
-                "unnormalized_angles": model_out['unnormalized_angles'],
-                "angles": model_out['angles'],
-                # atom 14
-                'positions' : pred_xyz,
-
-                # atom 37 for atom loss and fape loss
-                "final_atom_positions" : final_atom_positions,
-                "final_atom_mask": input_feats["atom37_atom_exists"],
-            }
-            pred_out.update(pred_out_sidechain)
-        return pred_out
-

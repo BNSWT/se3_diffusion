@@ -1,4 +1,8 @@
-mmCIF/
+
+data/*
+structure_prediction/data/*
+!data/*.py
+!structure_prediction/data/*.py
 
 inference_outputs/
 # Byte-compiled / optimized / DLL files
@@ -27,6 +31,7 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+slurm*
 MANIFEST
 
 # PyInstaller
@@ -161,14 +166,7 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
-data/data/
 outputs/
-
-#PDB processed dataset
-data/processed_pdb/
-data/processed_pdb_openfold/
-#PDBBind dataset
-DiffusionProteinLigand/data/PDBBind*
 
 #pynb for debug code
 pynb/
@@ -186,11 +184,6 @@ output/
 wandb/
 debug/
 eval_outputs/
-structure_prediction/data/AFDB_Cluster/
-structure_prediction/data/OpenProteinSet/
-structure_prediction/data/processed_pdb/
-structure_prediction/data/cameo/
-structure_prediction/data/casp14/
 structure_prediction/ckpt/
 structure_prediction/output/
 structure_prediction/wandb/

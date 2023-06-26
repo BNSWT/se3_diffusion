@@ -426,7 +426,8 @@ class Experiment:
                 if ckpt_metrics is not None:
                     wandb_logs['eval_time'] = eval_time
                     for metric_name in metrics.ALL_METRICS:
-                        wandb_logs[metric_name] = ckpt_metrics[metric_name].mean()
+                        if  metric_name in ckpt_metrics:
+                            wandb_logs[metric_name] = ckpt_metrics[metric_name].mean()
                     eval_table = wandb.Table(
                         columns=ckpt_metrics.columns.to_list()+['structure'])
                     for _, row in ckpt_metrics.iterrows():
@@ -471,14 +472,14 @@ class Experiment:
                 unpad_gt_prot = gt_prot[i][res_mask[i]]
                 unpad_gt_aatype = aatype[i][res_mask[i]]
                 percent_diffused = np.sum(unpad_diffused_mask) / num_res
-
+                file_path = os.path.abspath(os.path.join(
+                    eval_dir,
+                    f'len_{num_res}_sample_{i}_diffused_{percent_diffused:.2f}.pdb'
+                ))
                 # Extract argmax predicted aatype
                 saved_path = au.write_prot_to_pdb(
                     unpad_prot,
-                    os.path.join(
-                        eval_dir,
-                        f'len_{num_res}_sample_{i}_diffused_{percent_diffused:.2f}.pdb'
-                    ),
+                    file_path,
                     no_indexing=True,
                     b_factors=np.tile(1 - unpad_fixed_mask[..., None], 37) * 100
                 )
@@ -521,7 +522,7 @@ class Experiment:
         """
         self_condition = None
 
-        if self._model_conf.embed.embed_self_conditioning and self._generator.random() > 0.5:
+        if self._model_conf.embed.self_condition.version and self._generator.random() > 0.5:
             prev_batch = {}
             # prepare common feature for both step
             prev_batch = ({k:v for k,v in batch.items() if "self_condition_" not in k})
@@ -742,7 +743,7 @@ class Experiment:
         with torch.no_grad():
             model_out=None
             for t in reverse_steps:
-                if not (self._model_conf.embed.embed_self_conditioning and self_condition):
+                if not (self._model_conf.embed.self_condition.version and self_condition):
                     model_out=None
                 if t > min_t:
                     # TODO change selfcondition logic and switch Score model by switch embed model and train

@@ -28,6 +28,9 @@ from openfold.utils.loss import (
     supervised_chi_loss,
     lddt_ca
 )
+from openfold.utils.tensor_utils import (
+    tensor_tree_map,
+)
 from hydra.core.hydra_config import HydraConfig
 
 from analysis import utils as au
@@ -71,7 +74,6 @@ class Experiment:
         self._use_ddp = self._exp_conf.use_ddp
         self._conf.experiment.seed = du.seed_everything(self._conf.experiment.seed)
         self._generator = np.random.default_rng(self._conf.experiment.seed)
-
         if self._use_ddp :
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
             dist.init_process_group(backend='nccl')
@@ -80,55 +82,22 @@ class Experiment:
                 self._log.setLevel("ERROR")
                 self._use_wandb = False
                 self._exp_conf.ckpt_dir = None
-        # Warm starting
-        ckpt_model = None
-        ckpt_opt = None
+        else:
+            self.ddp_info = eu.get_ddp_info()
+
         self.trained_epochs = 0
         self.trained_steps = 0
-        if conf.experiment.warm_start:
-            ckpt_dir = conf.experiment.warm_start
-            self._log.info(f'Warm starting from: {ckpt_dir}')
-            ckpt_files = [
-                x for x in os.listdir(ckpt_dir)
-                if 'pkl' in x or '.pth' in x
-            ]
-            if len(ckpt_files) != 1:
-                raise ValueError(f'Ambiguous ckpt in {ckpt_dir}')
-            ckpt_name = ckpt_files[0]
-            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-            self._log.info(f'Loading checkpoint from {ckpt_path}')
-            ckpt_pkl = du.read_pkl(ckpt_path, use_torch=True)
-            ckpt_model = ckpt_pkl['model']
-
-            if conf.experiment.use_warm_start_conf:
-                OmegaConf.set_struct(conf, False)
-                conf = OmegaConf.merge(conf, ckpt_pkl['conf'])
-                OmegaConf.set_struct(conf, True)
-            conf.experiment.warm_start = ckpt_dir
-
-            # For compatibility with older checkpoints.
-            if 'optimizer' in ckpt_pkl:
-                ckpt_opt = ckpt_pkl['optimizer']
-            if 'epoch' in ckpt_pkl:
-                self.trained_epochs = ckpt_pkl['epoch']
-            if 'step' in ckpt_pkl:
-                self.trained_steps = ckpt_pkl['step']
 
         # Initialize experiment objects
         self._diffuser = se3_diffuser.SE3Diffuser(self._diff_conf)
         self._model = score_network.ScoreNetwork(self._model_conf, self._diffuser)
 
-        if ckpt_model is not None:
-            ckpt_model = {k.replace('module.', ''):v for k,v in ckpt_model.items()}
-            self._model.load_state_dict(ckpt_model, strict=True)
-
         num_parameters = sum(p.numel() for p in self._model.parameters())
         self._exp_conf.num_parameters = num_parameters
         self._log.info(f'Number of model parameters {num_parameters}')
+
         self._optimizer = torch.optim.Adam(
             self._model.parameters(), lr=self._exp_conf.learning_rate)
-        if ckpt_opt is not None:
-            self._optimizer.load_state_dict(ckpt_opt)
 
         if self._exp_conf.ckpt_dir is not None:
             # Set-up checkpoint location
@@ -168,6 +137,23 @@ class Experiment:
     @property
     def conf(self):
         return self._conf
+    
+    def load_ckpt(self,ckpt_path,device):
+
+        ckpt_pkl = du.read_pkl(ckpt_path, use_torch=True,map_location=device)
+
+        # ckpt_model = {k.replace('module.', ''):v for k,v in ckpt_pkl['model'].items()}
+        self._model.load_state_dict(ckpt_pkl['model'], strict=True)
+        # For compatibility with older checkpoints.
+        if 'optimizer' in ckpt_pkl:
+            self._optimizer.load_state_dict(ckpt_pkl['optimizer'])
+            self._optimizer.state = tensor_tree_map(lambda x : x.to(device),self._optimizer.state)
+
+        if 'epoch' in ckpt_pkl:
+            self.trained_epochs = ckpt_pkl['epoch']
+        if 'step' in ckpt_pkl:
+            self.trained_steps = ckpt_pkl['step']
+
 
     def create_dataset(self):
         
@@ -188,8 +174,8 @@ class Experiment:
             dataset=train_dataset,
             batch_size=self._exp_conf.batch_size,
             copy_num= self._exp_conf.copy_num,
-            num_replicas=self.ddp_info["world_size"] if self._use_ddp else 1,
-            rank= self.ddp_info["rank"] if self._use_ddp else 0,
+            num_replicas=self.ddp_info["world_size"],
+            rank= self.ddp_info["rank"],
             seed = self._conf.experiment.seed,
             shuffle=True,
             # only do limited shuffle for multi gpu training
@@ -257,6 +243,7 @@ class Experiment:
 
         assert(not self._exp_conf.use_ddp or self._exp_conf.use_gpu)
 
+        device = None
         # GPU mode
         if torch.cuda.is_available() and self._exp_conf.use_gpu:
             # single GPU mode
@@ -289,6 +276,20 @@ class Experiment:
             device = 'cpu'
             self._model = self.model.to(device)
             self._log.info(f"Using device: {device}")
+
+        if self.conf.experiment.warm_start:
+            ckpt_dir = self.conf.experiment.warm_start
+            self._log.info(f'Warm starting from: {ckpt_dir}')
+            ckpt_files = [
+                x for x in os.listdir(ckpt_dir)
+                if 'pkl' in x or '.pth' in x
+            ]
+            if len(ckpt_files) != 1:
+                raise ValueError(f'Ambiguous ckpt in {ckpt_dir}')
+            ckpt_name = ckpt_files[0]
+            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+            self._log.info(f'Loading checkpoint from {ckpt_path}')
+            self.load_ckpt(ckpt_path,device)
 
         self._model.train()
 
@@ -417,7 +418,8 @@ class Experiment:
                 if ckpt_metrics is not None:
                     wandb_logs['eval_time'] = eval_time
                     for metric_name in metrics.ALL_METRICS:
-                        wandb_logs[metric_name] = ckpt_metrics[metric_name].mean()
+                        if  metric_name in ckpt_metrics:
+                            wandb_logs[metric_name] = ckpt_metrics[metric_name].mean()
                     eval_table = wandb.Table(
                         columns=ckpt_metrics.columns.to_list()+['structure'])
                     for _, row in ckpt_metrics.iterrows():
@@ -462,14 +464,14 @@ class Experiment:
                 unpad_gt_prot = gt_prot[i][res_mask[i]]
                 unpad_gt_aatype = aatype[i][res_mask[i]]
                 percent_diffused = np.sum(unpad_diffused_mask) / num_res
-
+                file_path = os.path.abspath(os.path.join(
+                    eval_dir,
+                    f'len_{num_res}_sample_{i}_diffused_{percent_diffused:.2f}.pdb'
+                ))
                 # Extract argmax predicted aatype
                 saved_path = au.write_prot_to_pdb(
                     unpad_prot,
-                    os.path.join(
-                        eval_dir,
-                        f'len_{num_res}_sample_{i}_diffused_{percent_diffused:.2f}.pdb'
-                    ),
+                    file_path,
                     no_indexing=True,
                     b_factors=np.tile(1 - unpad_fixed_mask[..., None], 37) * 100
                 )
@@ -518,7 +520,7 @@ class Experiment:
         self_condition = None
         model_out = None
 
-        if self._model_conf.embed.embed_self_conditioning and self._generator.random() > 0.5:
+        if self._model_conf.embed.self_condition.version and self._generator.random() > 0.5:
             prev_batch = {}
             prev_batch = ({k:v for k,v in batch.items() if "self_condition_" not in k})
             prev_batch.update({k[len("self_condition_"):]:v for k,v in batch.items() if "self_condition_" in k})
@@ -773,7 +775,7 @@ class Experiment:
             model_out = None
             for t in reverse_steps:
                 if t > min_t:
-                    if not (self._model_conf.embed.embed_self_conditioning and self_condition):
+                    if not (self._model_conf.embed.self_condition.version and self_condition):
                         model_out=None
                     sample_feats = self._set_t_feats(sample_feats, t, t_placeholder)
                     model_out = self._model(sample_feats,self_condition=model_out)

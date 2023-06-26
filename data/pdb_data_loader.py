@@ -322,7 +322,7 @@ class PdbDataset(data.Dataset):
                 diffuse_mask=None,
                 t=t,
                 dt=dt,
-                center=True,
+                center=False,
                 noise_scale=0.0,
             )
             rot_score = self._diffuser.calc_rot_score(
