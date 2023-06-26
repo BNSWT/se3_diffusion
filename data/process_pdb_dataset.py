@@ -441,7 +441,7 @@ def main(args):
             max_resolution=args.max_resolution,
             write_dir=write_dir)
         # Uses max number of available cores.
-        with mp.Pool() as pool:
+        with mp.Pool(processes=args.num_processes) as pool:
             all_metadata = pool.map(_process_fn, all_mmcif_paths)
             
     all_metadata = [x for x in all_metadata if x is not None]

@@ -90,8 +90,7 @@ def run_mpnn(
     motif_mask: Optional[np.ndarray]=None):
     # Run PorteinMPNN
     prefix = os.path.splitext(os.path.basename(reference_pdb_path))[0]
-    # if "pyrosetta" in sys.modules:
-    if False:
+    if "pyrosetta" in sys.modules and mpnn_conf.pyrosetta:
         # get a dict contains mpnn_sequence,mpnn_score,mpnn_pose and their traj
         mpnn_results = protein_mpnn_pyrosetta.mpnn_design(mpnn_model,reference_pdb_path,mpnn_conf)
     else:

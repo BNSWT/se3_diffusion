@@ -2,6 +2,7 @@
 import os
 import numpy as np
 import torch
+from omegaconf import DictConfig, OmegaConf
 from typing import Optional
 import random
 import torch.distributed as dist
@@ -112,3 +113,17 @@ def get_sampled_mask(contigs, length, rng=None, num_tries=1000000):
         if count == num_tries: #contig string incompatible with this length
             raise ValueError("Contig string incompatible with --length range")
     return sampled_mask, sampled_mask_length, inpaint_chains
+
+def replace_path_with_cwd(cfg,path='./'):
+    """
+    递归遍历 OmegaConf 对象中的值，并将所有以 "./" 开头的 str 替换为当前程序执行目录
+    """
+    if isinstance(cfg, DictConfig):
+        for key in cfg.keys():
+            cfg[key] = replace_path_with_cwd(cfg[key],path=path)
+        return cfg
+    elif isinstance(cfg, str) and cfg.startswith('./'):
+        new_path = cfg.replace('./', f'{path}/',2)
+        return new_path
+    else:
+        return cfg

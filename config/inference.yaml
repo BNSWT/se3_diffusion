@@ -51,7 +51,7 @@ inference:
       flip : False
   mpnn : 
     pmpnn_dir : ${inference.pmpnn_dir}
-
+    pyrosetta: True
     gpu_id : ${inference.gpu_id}
     # Use CA_only model of backbone_atom model
     ca_only : False

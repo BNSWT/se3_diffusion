@@ -765,7 +765,7 @@ class Experiment:
                         noise_scale=noise_scale,
                     )
                 else:
-                    model_out = self.model(sample_feats)
+                    model_out = self.model(sample_feats,self_condition=model_out)
                     rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
                 sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)
                 if aux_traj:

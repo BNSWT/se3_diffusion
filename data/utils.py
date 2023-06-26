@@ -48,7 +48,7 @@ CHAIN_FEATS = [
     'res_mask','atom37_pos','atom37_mask','atom14_pos',
     # for sidechain atom rename and fape loss of sidechain(which use atom14 rather than atom37)
     'atom14_gt_exists','atom14_gt_position','atom14_alt_gt_exists','atom14_alt_gt_positions',
-    'atom14_atom_exists','atom14_atom_is_ambiguous',"rigidgroups_gt_exists","rigidgroups_gt_frames","rigidgroups_alt_gt_frames"
+    'atom14_atom_exists','atom14_atom_is_ambiguous',"rigidgroups_gt_exists","rigidgroups_gt_frames","rigidgroups_alt_gt_frames",
     # for complex rel pos encoding
     'chain_index'
 ]
@@ -191,7 +191,6 @@ def parse_pdb_feats(
     def _process_chain_id(x):
         chain_prot = process_chain(struct_chains[x], x)
         chain_dict = dataclasses.asdict(chain_prot)
-
         # Process features
         feat_dict = {x: chain_dict[x] for x in CHAIN_FEATS if x in chain_dict}
         return parse_chain_feats(
