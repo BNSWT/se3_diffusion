@@ -306,8 +306,7 @@ def process_mmcif(
 
     if not chains_dict:
         raise errors.DataError(f"No protein chains found in {mmcif_path}")
-    
-    dumped_chains = []
+    dump_chains = set()
     for assemble_data in assemble_metadatas:
         try:
             assemble_data["asym_id_list"] = [chain_id for chain_id in assemble_data["asym_id_list"] if chain_id in chains_dict]
@@ -317,6 +316,7 @@ def process_mmcif(
                 continue
             
             assemble_chains_dict = [chains_dict[chain_id] for chain_id in assemble_data["asym_id_list"]]
+            dump_chains.extend(assemble_data["asym_id_list"])
             assemble_feat_dict = du.concat_np_features(assemble_chains_dict, False)
             # trasform to pdb
             pdb_path = mmcif_path.replace('.cif', '.pdb')
@@ -346,21 +346,22 @@ def process_mmcif(
                 'radius_gyration' : pdb_dg[0],
 
             })
-            # dump pdb and fasta
-            for chain_id in assemble_data["asym_id_list"]:
-                if args.dump_chain_fasta and chain_id in chains_sequence and chain_id not in dumped_chains:
-                    fasta_path = os.path.join(mmcif_subdir, f'{mmcif_name}_{chain_id}.fasta')
-                    if not os.path.exists(fasta_path):
-                        open(fasta_path,"w").write(f">{mmcif_name}_{chain_id}\n{chains_sequence[chain_id]}")
-                if args.dump_chain_pdb and chain_id in chains_dict and chain_id not in dumped_chains:
-                    pdb_path = os.path.join(mmcif_subdir, f'{mmcif_name}_{chain_id}.pdb')
-                    chain_protein = Protein(**chains_dict[chain_id])
-                    pdb_string = to_pdb(chain_protein)
-                    if not os.path.exists(pdb_path):
-                        open(pdb_path,"w").write(pdb_string)
-                dumped_chains.append(chain_id)
         except Exception:
             logging.warning(errors.DataError(f"Error occured during process {mmcif_path} assemble {assemble_data['assemble_id']}\n"))
+    
+    # dump pdb and fasta for cluster
+    for chain_id in dump_chains:
+        if args.dump_chain_fasta and chain_id in chains_sequence :
+            fasta_path = os.path.join(mmcif_subdir, f'{mmcif_name}_{chain_id}.fasta')
+            if not os.path.exists(fasta_path):
+                open(fasta_path,"w").write(f">{mmcif_name}_{chain_id}\n{chains_sequence[chain_id]}")
+        if args.dump_chain_pdb and chain_id in chains_dict :
+            pdb_path = os.path.join(mmcif_subdir, f'{mmcif_name}_{chain_id}.pdb')
+            chain_protein = Protein(**chains_dict[chain_id])
+            pdb_string = to_pdb(chain_protein)
+            if not os.path.exists(pdb_path):
+                open(pdb_path,"w").write(pdb_string)
+    
     if not metadatas:
         raise errors.DataError(f"No assemble found in {mmcif_path}")
     if verbose:

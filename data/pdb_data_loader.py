@@ -1,6 +1,8 @@
 """PDB dataset loader."""
 import math
 from typing import TypeVar, Optional, Iterator
+import ast
+import os
 
 import torch
 import torch.distributed as dist
@@ -58,6 +60,7 @@ class PdbDataset(data.Dataset):
         self._data_conf = data_conf
         self._init_metadata()
         self._diffuser = diffuser
+        self._rng = np.random.default_rng()
 
     @property
     def is_training(self):
@@ -110,7 +113,7 @@ class PdbDataset(data.Dataset):
 
 
         filter_conf = self.data_conf.filtering
-        pdb_csv = pd.read_csv(self.data_conf.csv_path)
+        pdb_csv = pd.read_csv(self.data_conf.csv_path,converters={'asym_id_list': lambda x : ast.literal_eval(x) })
         self.raw_csv = pdb_csv
         if filter_conf.allowed_oligomer is not None and len(filter_conf.allowed_oligomer) > 0:
             filter_conf.allowed_oligomer= [oligomer.strip() for oligomer in filter_conf.allowed_oligomer]
@@ -144,12 +147,33 @@ class PdbDataset(data.Dataset):
         pdb_csv = pdb_csv.sort_values('modeled_seq_len', ascending=False)
         self._create_split(pdb_csv)
 
+        self.cluster_csv = None
+        if self.data_conf.cluster and self.is_training:
+            if os.path.exists(self.data_conf.cluster):
+                if self.data_conf.cluster.endswith(".tsv"):
+                    cluster_tsv = pd.read_csv(self.data_conf.cluster,delimiter='\t',names=['repID','memID'],index_col='memID')
+                    
+                    self._log.info(f'load cluster file {self.data_conf.cluster}')
+                    self._log.info(f'cluster info : {len(cluster_tsv.repID.unique())} clusters, {len(cluster_tsv)} chains')
+
+                    cluster_dict = cluster_tsv['repID'].to_dict()
+                    pdb_csv['rep_id_list'] = pdb_csv.apply(lambda x : tuple(sorted([cluster_dict.get(f'{x["pdb_name"]}_{asym_id}') for asym_id in x['asym_id_list'] if f'{x["pdb_name"]}_{asym_id}' in cluster_dict ])),axis=1)
+                    self.csv = pdb_csv[pdb_csv['rep_id_list']!=()]
+                    self.cluster_csv = pd.DataFrame(self.csv.groupby('rep_id_list',group_keys=False).apply(lambda group_data:group_data.index.tolist()),columns=['mem_id_list']).reset_index()
+                else:
+                    self._log.warning(f'Cluster file {self.data_conf.cluster} is not tsv format, cluster not used')
+            else:
+                self._log.warning(f'Cluster file {self.data_conf.cluster} not exists, cluster not used')
+        if self.is_training :
+            if self.cluster_csv is None:
+                self._log.info(f'Training: {len(self.csv)} examples')
+            else:
+                self._log.info(f'Training: {len(self.cluster_csv)} clusters, {len(self.csv)} examples')
+
     def _create_split(self, pdb_csv):
         # Training or validation specific logic.
         if self.is_training:
             self.csv = pdb_csv
-            self._log.info(
-                f'Training: {len(self.csv)} examples')
         else:
             all_lengths = np.sort(pdb_csv.modeled_seq_len.unique())
             length_indices = (len(all_lengths) - 1) * np.linspace(
@@ -167,8 +191,6 @@ class PdbDataset(data.Dataset):
     # cache make the same sample in same batch 
     @fn.lru_cache(maxsize=100)
     def _process_csv_row(self, processed_file_path , asym_id_list):
-        # reverse serialized asym_id_list
-        asym_id_list = [e.strip(" '[]") for e in asym_id_list.split(',')]
 
         chains_dict = du.read_pkl(processed_file_path)
 
@@ -270,13 +292,24 @@ class PdbDataset(data.Dataset):
         return diff_mask
 
     def __len__(self):
-        return len(self.csv)
+        return len(self.csv) if self.cluster_csv is None else len(self.cluster_csv)
 
     def __getitem__(self, idx):
+   
+        # Use a fixed seed for evaluation.
+        if not self.is_training:
+            rng = np.random.default_rng(idx)
+        else:
+            rng = self._rng
 
         # Sample data example.
-        example_idx = idx
-        csv_row = self.csv.iloc[example_idx]
+        if self.cluster_csv is None:
+            csv_row = self.csv.iloc[idx]
+        else:
+            mem_ids = self.cluster_csv.iloc[idx]['mem_id_list']
+            mem_id = rng.choice(mem_ids)
+            csv_row = self.csv.loc[mem_id]
+
         if 'pdb_name' in csv_row:
             pdb_name = csv_row['pdb_name']
         elif 'chain_name' in csv_row:
@@ -284,14 +317,8 @@ class PdbDataset(data.Dataset):
         else:
             raise ValueError('Need chain identifier.')
         processed_file_path = csv_row['processed_path']
-        asym_id_list = csv_row['asym_id_list']
-        assemble_feats = self._process_csv_row(processed_file_path,asym_id_list)
 
-        # Use a fixed seed for evaluation.
-        if self.is_training:
-            rng = np.random.default_rng(None)
-        else:
-            rng = np.random.default_rng(idx)
+        assemble_feats = self._process_csv_row(processed_file_path,tuple(csv_row['asym_id_list']))
 
         gt_bb_rigid = rigid_utils.Rigid.from_tensor_4x4(
             assemble_feats['rigidgroups_0'])[:, 0]
@@ -305,7 +332,7 @@ class PdbDataset(data.Dataset):
         # Sample t and diffuse.
         if self.is_training:
             # prev step feature for self-condition 
-            t = rng.uniform(self._data_conf.min_t, 1.0)
+            t = np.random.uniform(self._data_conf.min_t, 1.0)
             diff_feats_t_prev = self._diffuser.forward_marginal(
                 rigids_0=gt_bb_rigid,
                 t=t,
@@ -377,13 +404,12 @@ class LengthSampler(data.Sampler):
         ):
         self._data_conf = data_conf
         self._dataset = dataset
-        self._data_csv = self._dataset.csv
 
     def __iter__(self):
-        return iter(range(len(self._data_csv)))
+        return iter(range(len(self._dataset)))
 
     def __len__(self):
-        return len(self._data_csv)
+        return len(self._dataset)
 
 class TrainSampler(data.Sampler):
 
@@ -396,9 +422,7 @@ class TrainSampler(data.Sampler):
         ):
         self._data_conf = data_conf
         self._dataset = dataset
-        self._data_csv = self._dataset.csv
-        self._dataset_indices = list(range(len(self._data_csv)))
-        self._data_csv['index'] = self._dataset_indices
+        self._dataset_indices = list(range(len(self._dataset)))
         self._batch_size = batch_size
         self.epoch = 0
 
@@ -483,12 +507,10 @@ class DistributedTrainSampler(data.Sampler):
                 " [0, {}]".format(rank, num_replicas - 1))
         self._data_conf = data_conf
         self._dataset = dataset
-        self._data_csv = self._dataset.csv
-        self._dataset_indices = list(range(len(self._data_csv)))
-        self._data_csv['index'] = self._dataset_indices
+        self._dataset_indices = list(range(len(self._dataset)))
         self._copy_num = copy_num if copy_num else batch_size
         # _repeated_size is the size of the dataset multiply by batch size
-        self._repeated_size = batch_size * len(self._data_csv) if copy_num is None else copy_num * len(self._data_csv)
+        self._repeated_size = batch_size * len(self._dataset) if copy_num is None else copy_num * len(self._dataset)
         self._batch_size = batch_size
         self.num_replicas = num_replicas
         self.rank = rank
@@ -515,9 +537,9 @@ class DistributedTrainSampler(data.Sampler):
             # deterministically shuffle based on epoch and seed
             g = torch.Generator()
             g.manual_seed(self.seed + self.epoch)
-            indices = torch.randperm(len(self._data_csv), generator=g).tolist()  # type: ignore[arg-type]
+            indices = torch.randperm(len(self._dataset), generator=g).tolist()  # type: ignore[arg-type]
         else:
-            indices = list(range(len(self._data_csv)))  # type: ignore[arg-type]
+            indices = list(range(len(self._dataset)))  # type: ignore[arg-type]
 
         # indices is expanded by self._batch_size times
         indices = np.repeat(indices, self._copy_num)

@@ -6,6 +6,7 @@ defaults:
 data:
   # CSV for path and metadata to training examples.
   csv_path: ./data/processed_pdb/metadata.csv
+  cluster: ./data/foldseekDB/pdbDB/pdb90.tsv
   filtering:
     max_len: 512
     min_len: 60
