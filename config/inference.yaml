@@ -52,6 +52,7 @@ inference:
   mpnn : 
     pmpnn_dir : ${inference.pmpnn_dir}
     pyrosetta: True
+    cuda : True
     gpu_id : ${inference.gpu_id}
     # Use CA_only model of backbone_atom model
     ca_only : False

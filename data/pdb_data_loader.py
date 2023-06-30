@@ -350,7 +350,7 @@ class PdbDataset(data.Dataset):
                 t=t,
                 dt=dt,
                 center=False,
-                noise_scale=0.0,
+                noise_scale=1.0,
             )
             rot_score = self._diffuser.calc_rot_score(
                 rigids_t.get_rots()[None,...],

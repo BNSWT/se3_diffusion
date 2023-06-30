@@ -12,6 +12,7 @@ import hydra
 import logging
 import copy
 import random
+import copy
 import pandas as pd
 from collections import defaultdict
 from collections import deque
@@ -370,9 +371,9 @@ class Experiment:
                         self._exp_conf.ckpt_dir, f'step_{self.trained_steps}.pth')
                     du.write_checkpoint(
                         ckpt_path,
-                        self.model.state_dict(),
+                        copy.deepcopy(self.model.state_dict()),
                         self._conf,
-                        self._optimizer.state_dict(),
+                        copy.deepcopy(self._optimizer.state_dict()),
                         self.trained_epochs,
                         self.trained_steps,
                         logger=self._log,

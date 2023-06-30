@@ -144,13 +144,16 @@ class Sampler:
 
     def run(self,pdb_list,output_dir):
 
+        available_cpus = int(os.environ.get('SLURM_CPUS_ON_NODE', mp.cpu_count()))
+        cpu_nums = available_cpus if available_cpus < self._infer_conf.mpnn.cpus else self._infer_conf.mpnn.cpus
+        self._log.info(f'Using {cpu_nums} cpus')
         timestap = datetime.now().strftime("%dD_%mM_%YY_%Hh_%Mm_%Ss") if self._infer_conf.timestap else ""
         tmp_dir = os.path.join(output_dir,timestap, 'backup')
         final_results = []
         process_list = []
         if "pyrosetta" in sys.modules:
-            self.mpnn_model = protein_mpnn_pyrosetta.model_init(device=self.device,config=self._infer_conf.mpnn)
-        with (mp.Pool(processes=mp.cpu_count() if mp.cpu_count() < self._infer_conf.mpnn.cpus else self._infer_conf.mpnn.cpus) if not self._infer_conf.single_process else nullcontext() ) as pool:
+            self.mpnn_model = protein_mpnn_pyrosetta.model_init(device=self.device if self._infer_conf.mpnn.cuda else 'cpu',config=self._infer_conf.mpnn)
+        with (mp.Pool(processes=cpu_nums) if not self._infer_conf.single_process else nullcontext() ) as pool:
             os.makedirs(tmp_dir,exist_ok=True)
             for pdb_path in pdb_list:
                 self._log.info(f'run self consistency of file  {pdb_path}')     
@@ -169,12 +172,19 @@ class Sampler:
                             final_results.append(result)
                         except:
                             raise Exception(traceback.format_exc())
-                        def error_handler(error):
-                            print(error)
-                            sys.stdout.flush()                            
-                        run_esm_fold_callback_partial = partial(run_esm_fold_callback,output_dir=output_dir,reference_pdb_path=pdb_path)
-                        esmfold_result = pool.apply_async(run_mpnn,args=(self.mpnn_model,self._infer_conf.mpnn,tmp_dir,pdb_path),callback=run_esm_fold_callback_partial,error_callback=error_handler)
-                        process_list.append(esmfold_result)
+                    def error_handler(error):
+                        print(error)
+                        sys.stdout.flush()                        
+                    run_esm_fold_callback_partial = partial(run_esm_fold_callback,output_dir=output_dir,reference_pdb_path=pdb_path)
+                    esmfold_result = pool.apply_async(run_mpnn,args=(self.mpnn_model,self._infer_conf.mpnn,tmp_dir,pdb_path),callback=run_esm_fold_callback_partial,error_callback=error_handler)
+                    process_list.append(esmfold_result)
+                    if len(process_list) >= cpu_nums:
+                        while len(process_list) >= cpu_nums:
+                            time.sleep(1)
+                            for process in process_list:
+                                if process.ready():
+                                    process_list.remove(process)
+            
             if not self._infer_conf.single_process:
                 for process in process_list:
                     process.wait()
@@ -313,6 +323,7 @@ class Sampler:
 
 @hydra.main(version_base=None, config_path=f'{os.path.dirname(__file__)}/../config', config_name="inference")
 def run(conf: DictConfig) -> None:
+    torch.multiprocessing.set_start_method('spawn')
     logging.getLogger(__name__).setLevel(logging.INFO)
     conf.inference.output_dir = os.path.realpath(conf.inference.output_dir)
     cache_path = os.path.realpath(f'{os.path.dirname(__file__)}/../')

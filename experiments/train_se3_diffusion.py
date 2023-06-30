@@ -24,6 +24,7 @@ import hydra
 import logging
 import copy
 import random
+import copy
 import pandas as pd
 
 from collections import defaultdict
@@ -372,9 +373,9 @@ class Experiment:
                     self._exp_conf.ckpt_dir, f'step_{self.trained_steps}.pth')
                 du.write_checkpoint(
                     ckpt_path,
-                    self.model.state_dict(),
+                    copy.deepcopy(self.model.state_dict()),
                     self._conf,
-                    self._optimizer.state_dict(),
+                    copy.deepcopy(self._optimizer.state_dict()),
                     self.trained_epochs,
                     self.trained_steps,
                     logger=self._log,
@@ -450,6 +451,7 @@ class Experiment:
             return global_logs
 
     def eval_fn(self, eval_dir, valid_loader, device, min_t=None, num_t=None, noise_scale=1.0):
+        eval_dir = os.path.abspath(eval_dir)
         ckpt_eval_metrics = []
         for valid_feats, pdb_names in valid_loader:
             res_mask = du.move_to_np(valid_feats['res_mask'].bool())
@@ -472,10 +474,10 @@ class Experiment:
                 unpad_gt_prot = gt_prot[i][res_mask[i]]
                 unpad_gt_aatype = aatype[i][res_mask[i]]
                 percent_diffused = np.sum(unpad_diffused_mask) / num_res
-                file_path = os.path.abspath(os.path.join(
+                file_path = os.path.join(
                     eval_dir,
                     f'len_{num_res}_sample_{i}_diffused_{percent_diffused:.2f}.pdb'
-                ))
+                )
                 # Extract argmax predicted aatype
                 saved_path = au.write_prot_to_pdb(
                     unpad_prot,
