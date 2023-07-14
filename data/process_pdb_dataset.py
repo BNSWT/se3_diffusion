@@ -177,7 +177,7 @@ def _retrieve_mmcif_files(
             all_mmcif_paths = all_mmcif_paths[:10]
             break
     print(
-        f'Processing {len(all_mmcif_paths)} files our of {total_num_files}')
+        f'Processing {len(all_mmcif_paths)} files out of {total_num_files}')
     return all_mmcif_paths
 
 

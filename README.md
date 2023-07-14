@@ -144,7 +144,7 @@ inference:
     dump: True
     # Look more config in this file
 ```
-Inference output wuold be like
+Inference output would be like
 ```shell
 inference_outputs
 └── 12D_02M_2023Y_20h_46m_13s           # Date time of inference.
